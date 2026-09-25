@@ -8,6 +8,10 @@ logs/
 # 环境变量（含密钥，禁止入库）
 .env
 
+# 前端依赖（构建产物输出到 src/main/resources/static，随源码入库）
+node_modules/
+frontend/*.local
+
 # IDE
 .idea/
 *.iml
