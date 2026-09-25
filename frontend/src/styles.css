@@ -1,0 +1,54 @@
+:root {
+  --bg-app: #1b1b1d;
+  --bg-sidebar: #141416;
+  --bg-card: #232327;
+  --bg-hover: #2a2a2f;
+  --bg-bubble: #333339;
+  --border: #2e2e33;
+  --text-1: #e8e8ec;
+  --text-2: #9b9ba4;
+  --accent: #4d6bfe;
+}
+
+/* 覆盖 Element Plus 主色，贴近 ZCode 蓝 */
+html.dark {
+  --el-color-primary: #4d6bfe;
+  --el-color-primary-light-3: #6d85ff;
+  --el-color-primary-light-5: #8fa2ff;
+  --el-color-primary-light-7: #b1bdff;
+  --el-color-primary-light-8: #c8d0ff;
+  --el-color-primary-light-9: #e3e7ff;
+  --el-color-primary-dark-2: #3e56cb;
+  --el-bg-color: #232327;
+  --el-bg-color-overlay: #26262b;
+  --el-border-color: #2e2e33;
+  --el-border-color-light: #2e2e33;
+  --el-border-color-lighter: #29292e;
+  --el-fill-color-blank: #232327;
+  --el-fill-color-light: #2a2a2f;
+  --el-text-color-primary: #e8e8ec;
+  --el-text-color-regular: #c9c9d1;
+}
+
+* { box-sizing: border-box; }
+html, body, #app { height: 100%; margin: 0; }
+
+body {
+  background: var(--bg-app);
+  color: var(--text-1);
+  font-family: -apple-system, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: #3a3a41; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #4a4a52; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* 统一输入框暗色底色 */
+.el-input__wrapper,
+.el-textarea__inner {
+  background-color: var(--bg-card);
+  box-shadow: 0 0 0 1px var(--border) inset;
+}

@@ -1,0 +1,46 @@
+// 统一请求封装：后端返回 {code, message, data}，code=0 为成功；JWT 走 Authorization: Bearer
+export async function request(path, { method = 'GET', body } = {}) {
+  const headers = { 'Content-Type': 'application/json' }
+  const token = localStorage.getItem('token')
+  if (token) headers.Authorization = `Bearer ${token}`
+
+  let res
+  try {
+    res = await fetch(`/api${path}`, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined
+    })
+  } catch {
+    throw new Error('网络异常，请确认后端服务已启动')
+  }
+
+  if (res.status === 401) {
+    localStorage.removeItem('token')
+    localStorage.removeItem('username')
+    location.hash = '#/login'
+    throw new Error('登录已过期，请重新登录')
+  }
+
+  const json = await res.json().catch(() => ({ code: -1, message: '响应解析失败' }))
+  if (json.code !== 0) throw new Error(json.message || `请求失败（HTTP ${res.status}）`)
+  return json.data
+}
+
+export const authApi = {
+  register: (body) => request('/auth/register', { method: 'POST', body }),
+  login: (body) => request('/auth/login', { method: 'POST', body })
+}
+
+export const sessionApi = {
+  create: (body) => request('/sessions', { method: 'POST', body }),
+  page: (page = 1, size = 100) => request(`/sessions?page=${page}&size=${size}`),
+  detail: (id) => request(`/sessions/${id}`),
+  finish: (id) => request(`/sessions/${id}/finish`, { method: 'POST' }),
+  remove: (id) => request(`/sessions/${id}`, { method: 'DELETE' })
+}
+
+export const messageApi = {
+  send: (id, content) => request(`/sessions/${id}/messages`, { method: 'POST', body: { content } }),
+  list: (id, limit = 200) => request(`/sessions/${id}/messages?limit=${limit}`)
+}
