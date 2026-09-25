@@ -1,7 +1,7 @@
 # 项目状态（STATUS）
 
 > **每完成一个阶段更新本文件。** 方案见 [实现方案.md](./实现方案.md)，需求见 [需求文档.md](./需求文档.md)。
-> 最近更新：2026-09-25
+> 最近更新：2026-09-26
 
 ---
 
@@ -28,7 +28,7 @@
 |---|---|---|---|
 | 前端联调页 | 应用同源托管 | http://localhost:8080/ | 浏览器直接打开即可联调，无 CORS |
 | 应用 | Windows 本机 | localhost:8080 | `java -jar target/ai-interviewer-0.1.0-SNAPSHOT.jar`（根目录启动，读 .env） |
-| MySQL 8.0 | Windows 本机（MySQL80 服务） | localhost:3306 | 库 `ai_interviewer`，root/123456（见 .env） |
+| MySQL 8.0 | Windows 本机（MySQL80 服务） | localhost:3306 | 库 `ai_interviewer`，root 密码见 .env（不入库） |
 | Redis 8.6.3 | Windows 本机 | localhost:6379 | `F:\Redis\Redis-8.6.3-...-with-Service\redis-server.exe --port 6379 --save ""` |
 | LLM | 阿里云百炼 DashScope（OpenAI 兼容） | dashscope.aliyuncs.com/compatible-mode | 模型 qwen3.7-plus，key 在 .env（勿外传勿入库） |
 | Docker 中间件 | **虚拟机** | VM_IP | compose 未启用；Redis/RocketMQ/监控可在 VM 上 `docker compose up -d` |
@@ -59,7 +59,7 @@ java -jar target/ai-interviewer-0.1.0-SNAPSHOT.jar
 | POST | /api/sessions/{id}/messages | 发言 `{content}`，**同步返回面试官回复**（阶段 3 改 SSE） |
 | GET | /api/sessions/{id}/messages?limit&afterSeq | 消息列表 / 增量（afterSeq 即 SSE 续传偏移） |
 
-测试账号：tester01 / tester02（密码 test123456）；会话 5 是阶段 2 验收的完整面试记录（已结束）。
+测试账号：tester01 / tester02（仅本机联调，密码不写入文档）；会话 5 是阶段 2 验收的完整面试记录（已结束）。
 
 ---
 
