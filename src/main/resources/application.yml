@@ -1,0 +1,68 @@
+spring:
+  application:
+    name: ai-interviewer
+  # 读取项目根目录 .env（从项目根目录启动应用时生效）
+  config:
+    import: optional:file:.env[.properties]
+  datasource:
+    url: jdbc:mysql://${MYSQL_HOST:localhost}:${MYSQL_PORT:3306}/${MYSQL_DB:ai_interviewer}?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+    username: ${MYSQL_USER:root}
+    password: ${MYSQL_ROOT_PASSWORD:}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 2s   # 短超时：Redis 不可用时快速失败，走读库降级
+  jackson:
+    time-zone: Asia/Shanghai
+
+server:
+  port: ${SERVER_PORT:8080}
+
+spring.ai:
+  openai:
+    api-key: ${LLM_API_KEY:}
+    base-url: ${LLM_BASE_URL:https://dashscope.aliyuncs.com/compatible-mode}
+    chat:
+      completions-path: /v1/chat/completions
+      options:
+        model: ${LLM_MODEL:qwen3.7-plus}
+        temperature: 0.7
+
+interview.agent:
+  max-probes-per-question: 2   # 同一问题最多追问次数，超过强制切话题
+  max-questions: 10            # 单场面试最多提问数，达到后引导收尾
+  max-context-chars: 6000      # 组装 prompt 时对话记录的字符预算（滑动窗口裁剪）
+  decision-temperature: 0.2
+  generation-temperature: 0.7
+
+jwt:
+  secret: ${JWT_SECRET:}
+  expire-hours: 72
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.slf4j.Slf4jImpl
+  global-config:
+    banner: false
+    db-config:
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  metrics:
+    tags:
+      application: ${spring.application.name}
