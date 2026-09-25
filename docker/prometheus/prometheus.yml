@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: ai-interviewer
+    metrics_path: /actuator/prometheus
+    # 应用跑在 Windows 宿主机：Linux VM 容器内 host-gateway 指向 VM 自身网关，
+    # 接入监控时（阶段 6）把 target 改成宿主机在虚拟机网络里的 IP
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
