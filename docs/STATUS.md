@@ -238,7 +238,22 @@ java -jar target/ai-interviewer-0.1.0-SNAPSHOT.jar
 
 ---
 
-## 9. 下一步：阶段 5（MQ 异步报告，W5）
+## 9. 代码审查与修复（2026-09-26，阶段 4 后）
+
+全量审查报告见 [代码审查-2026-09-26.md](./代码审查-2026-09-26.md)（16 项发现 + 有意取舍 + 后续待办）。当场修复 4 项（mvn compile 通过）：
+
+| # | 修复 | 要点 |
+|---|---|---|
+| 1 | 超限简历上传 500→400 | 新增 `MaxUploadSizeExceededException` handler；tomcat `max-swallow-size` 调 12MB，否则超限较多时客户端收不到 400 响应 |
+| 2 | RerankClient 显式超时 | 连接 3s / 读 10s：DashScope 挂起不再占死生成线程，超时走既有"降级向量序" |
+| 3 | 删向量循环补删 | `deleteResumeVectors` 循环"检索→删除"直至不足一页，块数 >200 不再留孤儿向量 |
+| 4 | 生成线程池 core=max | agentGenExecutor core 4→8（=max），消除"队列满才扩容"导致的实际并发恒 4 |
+
+> 运行时回归（超限上传实测返回 400、rerank 正常路径）待下次启动应用时顺手验证；其余发现按审查报告"后续待办"跟进。
+
+---
+
+## 10. 下一步：阶段 5（MQ 异步报告，W5）
 
 1. RocketMQ（VM compose 或本机）：面试结束发消息 → 消费者聚合会话 → LLM 生成四维报告 → 落库
 2. **FR-15 三个都真实现**：幂等（uk_session + Redis setnx）、重试（退避 N 次）、死信（DLQ + 补偿查询）
