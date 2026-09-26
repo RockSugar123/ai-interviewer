@@ -308,8 +308,9 @@ java -jar target/ai-interviewer-0.1.0-SNAPSHOT.jar
 
 ---
 
-## 12. 下一步：阶段 8 交付
+## 12. 项目收尾（2026-09-26）
 
-1. README（架构图、选型 why-not 自检表）+ compose 一键部署整理
-2. 线上 demo：**唯一 Linux 硬需求**——云服务器采购与否待用户决策（替代方案：录屏 + 截图）
-3. 验收对照：需求文档 9 节 1-4 条
+- **用户决策：不上线，本机自用**——阶段 8 的云服务器/线上 demo/README 架构图不再执行，项目按"完成"归档
+- 阶段进度定格：0-6 全部完成；阶段 7 压测已砍；阶段 8 收尾取消
+- 自用启动清单：RocketMQ `scripts/start-rocketmq.bat` → Redis（F:\Redis 命令）→ 应用 `java -jar target/ai-interviewer-0.1.0-SNAPSHOT.jar` → 可选监控 `scripts/start-monitoring.bat`
+- 后续若要重启迭代（如 README、桌面端 FR-21），以本文档 + [实现方案.md](./实现方案.md) 为基准恢复上下文
