@@ -160,7 +160,7 @@ const answerStarted = ref(false)
 const thinkBodyRef = ref(null)
 
 const canSend = computed(
-  () => !!draft.value.trim() && !!activeId.value && !thinking.value && !finished.value
+  () => !!draft.value.trim() && !!activeId.value && !thinking.value
 )
 
 function startThinking() {
@@ -531,7 +531,7 @@ onMounted(loadSessions)
               v-model="draft"
               type="textarea"
               :autosize="{ minRows: 1, maxRows: 6 }"
-              :placeholder="finished ? '本场面试已结束' : '输入你的回答…（Enter 发送，Shift + Enter 换行）'"
+              :placeholder="finished ? '本场已结束——发送消息将继续练习' : '输入你的回答…（Enter 发送，Shift + Enter 换行）'"
               resize="none"
               @keydown="onKeydown"
             />

@@ -77,6 +77,8 @@ final class AgentPrompts {
             + "可先用 extractResumePoints 参考简历要点再出题。只问一个问题。";
     static final String INSTR_WRAP_UP = "面试到此结束。请给候选人一段简短收尾：肯定其表现、给一条最有价值的改进建议、"
             + "礼貌结束语。不要再提问。";
+    static final String INSTR_RESUME = "候选人之前结束了面试，现在回来继续练习。请用一句话简短欢迎其回来，"
+            + "然后结合简历要点与 JD 中此前尚未考察过的主题继续出题。只问一个问题。";
 
     static String trim(String s, int max) {
         if (s == null) {

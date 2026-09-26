@@ -1,7 +1,5 @@
 package com.aiinterviewer.service;
 
-import com.aiinterviewer.common.BusinessException;
-import com.aiinterviewer.common.ErrorCode;
 import com.aiinterviewer.dto.MessageResponse;
 import com.aiinterviewer.infra.persistence.entity.InterviewMessage;
 import com.aiinterviewer.infra.persistence.entity.InterviewSession;
@@ -48,12 +46,10 @@ public class ChatContextService {
     private final ObjectMapper objectMapper;
     private final TransactionTemplate transactionTemplate;
 
-    /** 用户发言：role 固定 USER，token 粗估（阶段 2 起以 LLM usage 为准） */
+    /** 用户发言：role 固定 USER，token 粗估（阶段 2 起以 LLM usage 为准）。
+     * 已结束会话不再拒收：发消息即自动续场（persistMessage 会把状态翻回 IN_PROGRESS，Agent 按 DONE 识别重开）。 */
     public MessageResponse append(long sessionId, long userId, String content) {
-        InterviewSession session = sessionService.getOwned(sessionId, userId);
-        if (InterviewSession.STATUS_FINISHED.equals(session.getStatus())) {
-            throw new BusinessException(ErrorCode.BAD_REQUEST, "会话已结束，不能再发言");
-        }
+        sessionService.getOwned(sessionId, userId);
         return persistMessage(sessionId, InterviewMessage.ROLE_USER, content, content.length(), null);
     }
 

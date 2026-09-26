@@ -1,8 +1,6 @@
 package com.aiinterviewer.agent;
 
 import com.aiinterviewer.agent.tools.InterviewTools;
-import com.aiinterviewer.common.BusinessException;
-import com.aiinterviewer.common.ErrorCode;
 import com.aiinterviewer.dto.Citation;
 import com.aiinterviewer.dto.MessageResponse;
 import com.aiinterviewer.infra.persistence.entity.InterviewMessage;
@@ -42,6 +40,10 @@ public class InterviewAgent {
     private static final PlannedAction OPENING_PLAN = new PlannedAction(
             AgentAction.NEXT_QUESTION, AgentPrompts.OPENING_RULE, InterviewPhase.QUESTIONING, 0, 1, false);
 
+    /** 已结束会话续场（用户反馈：历史会话要能继续）：跳过决策直接出题，计数清零开启新一轮 */
+    private static final PlannedAction RESUME_PLAN = new PlannedAction(
+            AgentAction.NEXT_QUESTION, AgentPrompts.INSTR_RESUME, InterviewPhase.QUESTIONING, 0, 0, false);
+
     private final ChatClient chatClient;
     private final SessionService sessionService;
     private final ChatContextService chatContextService;
@@ -63,12 +65,10 @@ public class InterviewAgent {
         this.props = props;
     }
 
-    /** 生成面试官回复（同步整段版，stream-enabled=false 时保留）。调用前用户消息必须已入库。 */
+    /** 生成面试官回复（同步整段版，stream-enabled=false 时保留）。调用前用户消息必须已入库。
+     * 会话为 FINISHED/DONE 时按续场处理（RESUME_PLAN），不再拒绝。 */
     public MessageResponse reply(long sessionId, long userId) {
         InterviewSession session = sessionService.getOwned(sessionId, userId);
-        if (InterviewSession.STATUS_FINISHED.equals(session.getStatus())) {
-            throw new BusinessException(ErrorCode.BAD_REQUEST, "面试已结束，不能再对话");
-        }
         InterviewPhase phase = InterviewPhase.from(session.getAgentState());
         String jdText = session.getJdText();
         String transcript = buildTranscript(sessionId, userId);
@@ -80,6 +80,11 @@ public class InterviewAgent {
             return finishPlan(sessionId, userId, jdText, transcript, null,
                     session.getResumeFileId(), OPENING_PLAN, tools);
         }
+        if (phase == InterviewPhase.DONE) {
+            log.info("[Agent] 已结束会话续场 session={}", sessionId);
+            return finishPlan(sessionId, userId, jdText, transcript, null,
+                    session.getResumeFileId(), RESUME_PLAN, tools);
+        }
         AgentDecision decision = decide(phase, session, jdText, transcript);
         PlannedAction plan = planAction(sessionId, phase, decision,
                 nz(session.getProbeCount()), nz(session.getQuestionCount()));
@@ -88,13 +93,11 @@ public class InterviewAgent {
     }
 
     /** 流式版主链路（W3）：决策与守卫同同步路径，生成改为逐 token 回调；结束后落库 + 推进状态机。
-     *  onThink 回调逐段推送思维链（qwen reasoning_content，Spring AI 1.1+ 经 AssistantMessage metadata 透出）。 */
+     *  onThink 回调逐段推送思维链（qwen reasoning_content，Spring AI 1.1+ 经 AssistantMessage metadata 透出）。
+     *  会话为 FINISHED/DONE 时按续场处理（RESUME_PLAN），不再拒绝。 */
     public MessageResponse replyStreaming(long sessionId, long userId, Consumer<String> onDelta,
                                           Consumer<String> onThink) {
         InterviewSession session = sessionService.getOwned(sessionId, userId);
-        if (InterviewSession.STATUS_FINISHED.equals(session.getStatus())) {
-            throw new BusinessException(ErrorCode.BAD_REQUEST, "面试已结束，不能再对话");
-        }
         InterviewPhase phase = InterviewPhase.from(session.getAgentState());
         String jdText = session.getJdText();
         String transcript = buildTranscript(sessionId, userId);
@@ -106,6 +109,9 @@ public class InterviewAgent {
         if (phase == null) {
             log.info("[Agent] 开场（流式） session={}", sessionId);
             plan = OPENING_PLAN;
+        } else if (phase == InterviewPhase.DONE) {
+            log.info("[Agent] 已结束会话续场（流式） session={}", sessionId);
+            plan = RESUME_PLAN;
         } else {
             AgentDecision decision = decide(phase, session, jdText, transcript);
             decisionTopic = decision.topic();
