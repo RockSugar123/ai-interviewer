@@ -49,7 +49,7 @@ function clearActive() {
 }
 
 async function selectSession(id) {
-  if (thinking.value) {
+  if (thinking.value || streaming.value) {
     ElMessage.warning('面试官回复中，请稍候')
     return
   }
@@ -89,11 +89,16 @@ async function createSession() {
   }
 }
 
-/* ---------- 发送与回复 ---------- */
+/* ---------- 发送与流式回复（W3 SSE） ---------- */
 const draft = ref('')
 const thinking = ref(false)
 const thinkSeconds = ref(0)
 let thinkTimer = null
+const streaming = ref(false)
+const streamText = ref('')
+let eventSource = null
+let streamBuf = ''
+let pendingRaf = null
 
 const canSend = computed(
   () => !!draft.value.trim() && !!activeId.value && !thinking.value && !finished.value
@@ -110,7 +115,27 @@ function stopThinking() {
   clearInterval(thinkTimer)
 }
 
-onBeforeUnmount(stopThinking)
+function closeStream() {
+  if (eventSource) {
+    eventSource.close()
+    eventSource = null
+  }
+  if (pendingRaf) {
+    cancelAnimationFrame(pendingRaf)
+    pendingRaf = null
+  }
+}
+
+onBeforeUnmount(() => {
+  stopThinking()
+  closeStream()
+})
+
+function flushStreamBuf() {
+  pendingRaf = null
+  streamText.value = streamBuf
+  scrollToBottom()
+}
 
 function scrollToBottom() {
   // 等内容完成一轮布局后再滚动，否则会停在旧高度上
@@ -125,33 +150,109 @@ function scrollToBottom() {
   })
 }
 
+/** 订阅面试官回复流。delta 追加（rAF 合帧渲染），full-delta 整段替换（断线重连快照），done 落定终稿 */
+function attachStream(afterSeq) {
+  streaming.value = true
+  streamText.value = ''
+  streamBuf = ''
+  const es = new EventSource(messageApi.streamUrl(activeId.value, afterSeq))
+  eventSource = es
+  es.addEventListener('delta', (e) => {
+    streamBuf += JSON.parse(e.data).text
+    if (!pendingRaf) pendingRaf = requestAnimationFrame(flushStreamBuf)
+  })
+  es.addEventListener('full-delta', (e) => {
+    streamBuf = JSON.parse(e.data).text
+    if (pendingRaf) {
+      cancelAnimationFrame(pendingRaf)
+      pendingRaf = null
+    }
+    streamText.value = streamBuf
+    scrollToBottom()
+  })
+  es.addEventListener('done', (e) => {
+    const payload = JSON.parse(e.data)
+    closeStream()
+    streaming.value = false
+    stopThinking()
+    if (payload.message) messages.value.push(payload.message)
+    if (payload.agentState && activeSession.value && activeSession.value.id === activeId.value) {
+      activeSession.value.agentState = payload.agentState
+      activeSession.value.status = payload.status
+    }
+    loadSessions()
+    scrollToBottom()
+  })
+  es.addEventListener('error', (e) => {
+    if (e.data) {
+      // 服务端 error 事件：生成失败，用户消息已保留，可重新发送
+      closeStream()
+      streaming.value = false
+      stopThinking()
+      let msg = '面试官回复失败，请重新发送'
+      try {
+        msg = JSON.parse(e.data).message || msg
+      } catch {
+        /* 保留默认文案 */
+      }
+      ElMessage.error(msg)
+      realign()
+    } else if (es.readyState === EventSource.CLOSED) {
+      // 连接被服务端拒绝（如登录过期），浏览器不再自动重连
+      closeStream()
+      streaming.value = false
+      stopThinking()
+      ElMessage.error('连接已断开，请重试')
+    }
+    // 其余为网络抖动：浏览器自动重连（Last-Event-ID 续传），保持等待/流式状态
+  })
+}
+
+async function realign() {
+  try {
+    messages.value = await messageApi.list(activeId.value)
+  } catch {
+    /* 保持现状 */
+  }
+}
+
+function refreshSessionState() {
+  sessionApi
+    .detail(activeId.value)
+    .then((d) => {
+      if (d.id === activeId.value) activeSession.value = d
+    })
+    .catch(() => {})
+}
+
 async function send() {
   if (!canSend.value) return
   const content = draft.value.trim()
   draft.value = ''
-  messages.value.push({ seq: Date.now(), role: 'USER', content })
+  const pending = { seq: `tmp-${Date.now()}`, role: 'USER', content }
+  messages.value.push(pending)
   scrollToBottom()
   startThinking()
   try {
-    const reply = await messageApi.send(activeId.value, content)
-    messages.value.push(reply)
-    // 回复会推进状态机（出题/追问/收尾），后台刷新会话状态标签
-    sessionApi
-      .detail(activeId.value)
-      .then((d) => {
-        if (d.id === activeId.value) activeSession.value = d
-      })
-      .catch(() => {})
+    const userMsg = await messageApi.send(activeId.value, content)
+    const idx = messages.value.indexOf(pending)
+    if (userMsg.role === 'ASSISTANT') {
+      // 服务端关闭流式（同步整段路径）：按旧逻辑展示完整回复
+      if (idx >= 0) messages.value.splice(idx, 1)
+      messages.value.push(userMsg)
+      stopThinking()
+      refreshSessionState()
+      scrollToBottom()
+      return
+    }
+    if (idx >= 0) messages.value[idx] = userMsg
+    scrollToBottom()
+    attachStream(userMsg.seq)
   } catch (e) {
+    stopThinking()
     ElMessage.error(e.message)
     // 用户消息可能已落库，拉取一次真实消息列表对齐
-    try {
-      messages.value = await messageApi.list(activeId.value)
-    } catch {
-      /* 保持现状 */
-    }
-  } finally {
-    stopThinking()
+    await realign()
     scrollToBottom()
   }
 }
@@ -291,12 +392,17 @@ onMounted(loadSessions)
               <div class="bubble">{{ m.content }}</div>
             </div>
 
-            <div v-if="thinking" class="msg ai">
+            <div v-if="thinking && !streaming" class="msg ai">
               <div class="ai-avatar">面</div>
               <div class="thinking-box">
                 <span class="dots"><i></i><i></i><i></i></span>
                 面试官思考中 · {{ thinkSeconds }}s
               </div>
+            </div>
+
+            <div v-if="streaming" class="msg ai">
+              <div class="ai-avatar">面</div>
+              <div class="bubble streaming-bubble">{{ streamText }}<span class="caret"></span></div>
             </div>
           </div>
         </el-scrollbar>
@@ -551,6 +657,22 @@ onMounted(loadSessions)
 }
 
 .msg.ai .bubble { max-width: 660px; padding-top: 3px; }
+
+/* 流式气泡：内容逐段到达，光标提示仍在输出 */
+.streaming-bubble .caret {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: -0.15em;
+  background: var(--accent);
+  animation: caret-blink 0.9s steps(2) infinite;
+}
+
+@keyframes caret-blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
 
 .msg.me .bubble {
   max-width: 660px;
