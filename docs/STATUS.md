@@ -160,9 +160,18 @@ java -jar target/ai-interviewer-0.1.0-SNAPSHOT.jar
 | 6 | 浏览器两轮流式闭环：发送→思考→打字机→终稿→状态标签刷新（截图） | ✅ |
 | 7 | /actuator/prometheus 首token指标有数（8 次，均值 ~24s，思维链模型所致） | ✅ |
 
+### 补充：思考链流式 + Spring AI 升级 1.1.8（2026-09-26，用户反馈后追加）
+
+用户反馈"没展示思考链、体感不是流式"——根因：Spring AI 1.0.0 的 OpenAI 模块无 `reasoningContent` 字段，qwen 思维链在 Jackson 反序列化时被静默丢弃，导致 24s 思考期前端完全静默（内容阶段其实只有 2-6s，"一股脑"是等待期没内容的观感）。
+
+- **Spring AI 1.0.0 → 1.1.8**：1.1 的 `ChatCompletionMessage` 增加 `reasoningContent` 并经 `AssistantMessage.metadata["reasoningContent"]` 透出（查 jar 字节码确认）；全项目 API 兼容，零改动编译通过
+- **协议扩展**：新增 `think`（思维链增量）/ `full-think`（重连快照）事件，与 delta 家族同语义；`done` 负载新增 `thinking` 全文（**不落库**，随文一次性下发，刷新即失）
+- **前端**：思考期流式滚动展示推理全文（灰色折叠面板）；答案开始自动折叠为"已深度思考（Ns）▸"可展开回看；重连时 `full-think` 快照替换
+- **验证**：单轮 201 个 think 事件逐段推送 + 18 delta + done 带全文；浏览器实测推理 23s 全程可见、折叠/展开正常（DOM 验证，截图子系统当时故障）
+
 ### 已知问题 / 有意取舍
 
-- **首 token 延迟 ~24s**：qwen3.7-plus 思维链阶段无内容分片（reasoning_content 不走 content），SSE 只优化了答案展开段（~2-6s 流完）；`enable_thinking:false` 注入仍是调优备选
+- **首 token 延迟 ~24s**：qwen3.7-plus 思维链阶段无内容分片，思考链流式展示后等待期不再静默；`enable_thinking:false` 注入仍是调优备选
 - 流式 usage 依赖端点回传，缺失时按中文密度粗估（chars/2）
 - 应用重启丢失 in-flight 生成（内存态）：用户消息已落库，重发即可；W6 稳定性范围
 - 多轮漏看的已持久化消息经 stream 重连会按 done 逐条回放（真实前端不会出现：一次只挂一轮流）

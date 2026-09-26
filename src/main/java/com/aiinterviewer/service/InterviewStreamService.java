@@ -7,6 +7,7 @@ import com.aiinterviewer.dto.MessageResponse;
 import com.aiinterviewer.dto.StreamDelta;
 import com.aiinterviewer.dto.StreamDone;
 import com.aiinterviewer.dto.StreamError;
+import com.aiinterviewer.dto.StreamThink;
 import com.aiinterviewer.infra.persistence.entity.InterviewSession;
 import com.aiinterviewer.infra.persistence.mapper.InterviewSessionMapper;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -32,9 +33,11 @@ import java.util.concurrent.TimeUnit;
 /**
  * SSE 流式编排（W3）：会话级生成注册表 + 订阅者广播 + 断线快照回放。
  *
- * 事件协议：delta（增量）/ full-delta（累计快照，替换语义，重连不丢不重的关键）/
- * done（终稿消息 + 状态机状态）/ error（可读失败原因）。流式期事件 id 一律为用户消息 seq，
- * 助手消息真实 seq 持久化后才可知，随 done 下发；断线期间生成已完成的场景走 afterSeq 库回放。
+ * 事件协议：think/full-think（思维链增量/快照，Spring AI 1.1+ 透出的 reasoning_content）/
+ * delta（增量）/ full-delta（累计快照，替换语义，重连不丢不重的关键）/
+ * done（终稿消息 + 状态机状态 + 思考链全文）/ error（可读失败原因）。
+ * 流式期事件 id 一律为用户消息 seq，助手消息真实 seq 持久化后才可知，随 done 下发；
+ * 断线期间生成已完成的场景走 afterSeq 库回放。思考链不落库（done 后一次性随文下发，刷新即失）。
  *
  * 并发约定：同一 Generation 的所有 emitter 写操作（广播/快照/心跳）都在该 Generation 的锁内串行——
  * SseEmitter 底层响应流不支持并发写，且快照与后续增量必须有序，否则重连回放会出现缺口或重复。
@@ -126,8 +129,8 @@ public class InterviewStreamService {
     private void run(Generation generation, long userId) {
         try {
             MessageResponse reply = interviewAgent.replyStreaming(generation.sessionId, userId,
-                    generation::publish);
-            // writeAssistant/updatePhase 在 agent 内已完成，此处读最新状态随 done 下发
+                    generation::publish, generation::publishThink);
+            // writeAssistant/updatePhase 在 agent 内已完成，此处读最新状态随 done 下发（思考链不落库，随 done 一次性下发）
             InterviewSession session = sessionMapper.selectById(generation.sessionId);
             generation.complete(reply, session);
             log.info("[SSE] 生成完成 session={} userMsgSeq={} replySeq={} chars={}",
@@ -154,14 +157,14 @@ public class InterviewStreamService {
                     any = true;
                     send(emitter, "done", String.valueOf(m.seq()),
                             new StreamDone(m, session == null ? null : session.getAgentState(),
-                                    session == null ? null : session.getStatus()));
+                                    session == null ? null : session.getStatus(), null));
                 }
             }
             if (!any) {
                 // 无可回放内容也必须发 done，否则浏览器 EventSource 会对静默关闭无限重连
                 send(emitter, "done", String.valueOf(afterSeq == null ? 0 : afterSeq),
                         new StreamDone(null, session == null ? null : session.getAgentState(),
-                                session == null ? null : session.getStatus()));
+                                session == null ? null : session.getStatus(), null));
             }
             emitter.complete();
         } catch (Exception e) {
@@ -195,6 +198,8 @@ public class InterviewStreamService {
         private final Timer.Sample firstTokenSample;
         private final Object lock = new Object();
         private final StringBuilder accumulated = new StringBuilder();
+        /** 思维链缓冲（不落库，随 done 全文下发 + live 期间 think 事件增量推送） */
+        private final StringBuilder thinkBuffer = new StringBuilder();
         private final List<SseEmitter> subscribers = new ArrayList<>();
         private boolean finished;
         private boolean firstTokenSeen;
@@ -228,7 +233,22 @@ public class InterviewStreamService {
             }
         }
 
-        /** 订阅加入：withSnapshot 时先回放累计快照（替换语义），再并入后续直播 */
+        /** 生成线程逐段推送思维链（重连窗口语义与 publish 相同：锁内快照有序） */
+        void publishThink(String chunk) {
+            List<SseEmitter> targets;
+            synchronized (lock) {
+                if (finished) {
+                    return;
+                }
+                thinkBuffer.append(chunk);
+                targets = List.copyOf(subscribers);
+            }
+            for (SseEmitter target : targets) {
+                send(target, "think", String.valueOf(userMsgSeq), new StreamThink(userMsgSeq, chunk));
+            }
+        }
+
+        /** 订阅加入：withSnapshot 时先回放思考快照与答案快照（替换语义），再并入后续直播 */
         void attach(SseEmitter emitter, boolean withSnapshot) {
             synchronized (lock) {
                 if (finished) {
@@ -236,9 +256,15 @@ public class InterviewStreamService {
                     if (finalError != null) {
                         send(emitter, "error", String.valueOf(userMsgSeq), finalError);
                     } else {
-                        if (withSnapshot && accumulated.length() > 0) {
-                            send(emitter, "full-delta", String.valueOf(userMsgSeq),
-                                    new StreamDelta(userMsgSeq, accumulated.toString()));
+                        if (withSnapshot) {
+                            if (thinkBuffer.length() > 0) {
+                                send(emitter, "full-think", String.valueOf(userMsgSeq),
+                                        new StreamThink(userMsgSeq, thinkBuffer.toString()));
+                            }
+                            if (accumulated.length() > 0) {
+                                send(emitter, "full-delta", String.valueOf(userMsgSeq),
+                                        new StreamDelta(userMsgSeq, accumulated.toString()));
+                            }
                         }
                         send(emitter, "done", String.valueOf(
                                         finalDone != null && finalDone.message() != null
@@ -250,20 +276,28 @@ public class InterviewStreamService {
                 }
                 subscribers.add(emitter);
                 registerLifecycle(emitter);
-                if (withSnapshot && accumulated.length() > 0) {
-                    send(emitter, "full-delta", String.valueOf(userMsgSeq),
-                            new StreamDelta(userMsgSeq, accumulated.toString()));
+                if (withSnapshot) {
+                    if (thinkBuffer.length() > 0) {
+                        send(emitter, "full-think", String.valueOf(userMsgSeq),
+                                new StreamThink(userMsgSeq, thinkBuffer.toString()));
+                    }
+                    if (accumulated.length() > 0) {
+                        send(emitter, "full-delta", String.valueOf(userMsgSeq),
+                                new StreamDelta(userMsgSeq, accumulated.toString()));
+                    }
                 }
             }
         }
 
         void complete(MessageResponse reply, InterviewSession session) {
             List<SseEmitter> targets;
+            String thinking;
             synchronized (lock) {
                 finished = true;
+                thinking = thinkBuffer.toString();
                 finalDone = new StreamDone(reply,
                         session == null ? null : session.getAgentState(),
-                        session == null ? null : session.getStatus());
+                        session == null ? null : session.getStatus(), thinking);
                 targets = List.copyOf(subscribers);
                 subscribers.clear();
             }
