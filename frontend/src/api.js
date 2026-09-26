@@ -40,6 +40,35 @@ export const sessionApi = {
   remove: (id) => request(`/sessions/${id}`, { method: 'DELETE' })
 }
 
+export const resumeApi = {
+  list: () => request('/resumes'),
+  remove: (id) => request(`/resumes/${id}`, { method: 'DELETE' }),
+  // multipart 单独处理（request 封装只走 JSON）
+  upload: async (file) => {
+    const form = new FormData()
+    form.append('file', file)
+    let res
+    try {
+      res = await fetch('/api/resumes', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${localStorage.getItem('token') || ''}` },
+        body: form
+      })
+    } catch {
+      throw new Error('网络异常，请确认后端服务已启动')
+    }
+    if (res.status === 401) {
+      localStorage.removeItem('token')
+      localStorage.removeItem('username')
+      location.hash = '#/login'
+      throw new Error('登录已过期，请重新登录')
+    }
+    const json = await res.json().catch(() => ({ code: -1, message: '上传失败' }))
+    if (json.code !== 0) throw new Error(json.message || `上传失败（HTTP ${res.status}）`)
+    return json.data
+  }
+}
+
 export const messageApi = {
   // W3 起返回发送成功的用户消息（含真实 seq），面试官回复经 streamUrl 的 SSE 推送
   send: (id, content) => request(`/sessions/${id}/messages`, { method: 'POST', body: { content } }),

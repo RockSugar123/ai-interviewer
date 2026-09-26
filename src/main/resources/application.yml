@@ -35,6 +35,14 @@ spring.ai:
       options:
         model: ${LLM_MODEL:qwen3.7-plus}
         temperature: 0.7
+    embedding:
+      options:
+        model: ${EMBEDDING_MODEL:text-embedding-v4}
+        dimensions: 1024
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 12MB
 
 interview.agent:
   max-probes-per-question: 2   # 同一问题最多追问次数，超过强制切话题
@@ -47,6 +55,17 @@ interview.agent:
 
 interview.stream:
   emitter-timeout-ms: 300000   # SSE 连接最长保持时间（覆盖一次完整生成）
+
+interview.rag:
+  enabled: true                # RAG 总开关：false 时上传/检索/引用全部停用，行为同阶段 3
+  store-path: ${RAG_STORE_PATH:./data/rag-store.json}
+  upload-dir: ${RESUME_UPLOAD_DIR:./data/uploads}
+  recall-top-k: 20             # 向量召回条数（重排前）
+  final-top-k: 5               # 重排后注入条数
+  min-score: 0.4               # 相似度阈值
+  rerank-enabled: true         # gte-rerank-v2 重排（失败降级为向量序）
+  rerank-base-url: ${DASHSCOPE_RERANK_BASE_URL:https://dashscope.aliyuncs.com}
+  max-inject-chars: 2400       # 注入生成 prompt 的资料字符预算
 
 jwt:
   secret: ${JWT_SECRET:}

@@ -97,6 +97,16 @@
             <groupId>org.springframework.ai</groupId>
             <artifactId>spring-ai-starter-model-openai</artifactId>
         </dependency>
+        <!-- RAG 文档解析（阶段 4）：Tika 统一 PDF/Word -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-tika-document-reader</artifactId>
+        </dependency>
+        <!-- 向量库抽象 + SimpleVectorStore（阶段 4）：1.0 起拆分为独立模块 -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-vector-store</artifactId>
+        </dependency>
 
         <!-- 工具 -->
         <dependency>
