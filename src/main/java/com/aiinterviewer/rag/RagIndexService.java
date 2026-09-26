@@ -85,17 +85,28 @@ public class RagIndexService {
     public void deleteResumeVectors(Long userId, Long resumeFileId) {
         try {
             String expr = "resumeFileId == " + resumeFileId + " && userId == " + userId;
-            List<Document> hits = vectorStore.similaritySearch(SearchRequest.builder()
-                    .query("resume")
-                    .topK(200)
-                    .filterExpression(FILTER_PARSER.parse(expr))
-                    .build());
-            if (hits == null || hits.isEmpty()) {
-                return;
+            var filter = FILTER_PARSER.parse(expr);
+            int deleted = 0;
+            while (true) {
+                // topK=200 只是单页上限：块数超一页时分批删净（每轮删完下一轮必然更少，保证终止）
+                List<Document> hits = vectorStore.similaritySearch(SearchRequest.builder()
+                        .query("resume")
+                        .topK(200)
+                        .filterExpression(filter)
+                        .build());
+                if (hits == null || hits.isEmpty()) {
+                    break;
+                }
+                vectorStore.delete(hits.stream().map(Document::getId).toList());
+                deleted += hits.size();
+                if (hits.size() < 200) {
+                    break;
+                }
             }
-            vectorStore.delete(hits.stream().map(Document::getId).toList());
-            saveStore();
-            log.info("[RAG] 简历向量已清理 [userId={} resumeFileId={} count={}]", userId, resumeFileId, hits.size());
+            if (deleted > 0) {
+                saveStore();
+                log.info("[RAG] 简历向量已清理 [userId={} resumeFileId={} count={}]", userId, resumeFileId, deleted);
+            }
         } catch (Exception e) {
             log.warn("[RAG] 简历向量清理失败（不影响删除流程） [resumeFileId={}]", resumeFileId, e);
         }

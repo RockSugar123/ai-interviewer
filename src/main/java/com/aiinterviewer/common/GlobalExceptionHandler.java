@@ -6,6 +6,7 @@ import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.multipart.MaxUploadSizeExceededException;
 
 @Slf4j
 @RestControllerAdvice
@@ -37,6 +38,13 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiResponse<Void>> handleUnreadable(HttpMessageNotReadableException e) {
         return ResponseEntity.badRequest()
                 .body(ApiResponse.error(ErrorCode.BAD_REQUEST.code(), "请求体格式错误"));
+    }
+
+    /** multipart 层在进入 Controller 前抛出，不接住会落 500（ResumeService 里的 10MB 校验轮不到执行） */
+    @ExceptionHandler(MaxUploadSizeExceededException.class)
+    public ResponseEntity<ApiResponse<Void>> handleMaxUpload(MaxUploadSizeExceededException e) {
+        return ResponseEntity.badRequest()
+                .body(ApiResponse.error(ErrorCode.BAD_REQUEST.code(), "文件不能超过 10MB"));
     }
 
     /** 兜底：不吞任何异常，全量落日志 */

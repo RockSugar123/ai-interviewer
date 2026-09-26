@@ -21,7 +21,8 @@ public class AsyncConfig {
     @Bean("agentGenExecutor")
     public ThreadPoolTaskExecutor agentGenExecutor() {
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(4);
+        // JDK 线程池"队列满才从 core 扩到 max"：LLM 生成为长任务，core<max 时 max 形同虚设，直接 core=max
+        executor.setCorePoolSize(8);
         executor.setMaxPoolSize(8);
         executor.setQueueCapacity(50);
         executor.setThreadNamePrefix("agent-gen-");
