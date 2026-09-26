@@ -41,6 +41,10 @@ export const sessionApi = {
 }
 
 export const messageApi = {
+  // W3 起返回发送成功的用户消息（含真实 seq），面试官回复经 streamUrl 的 SSE 推送
   send: (id, content) => request(`/sessions/${id}/messages`, { method: 'POST', body: { content } }),
-  list: (id, limit = 200) => request(`/sessions/${id}/messages?limit=${limit}`)
+  list: (id, limit = 200) => request(`/sessions/${id}/messages?limit=${limit}`),
+  // EventSource 无法携带 Authorization 头，仅此端点后端支持 token 查询参数
+  streamUrl: (id, afterSeq) =>
+    `/api/sessions/${id}/messages/stream?afterSeq=${afterSeq}&token=${encodeURIComponent(localStorage.getItem('token') || '')}`
 }

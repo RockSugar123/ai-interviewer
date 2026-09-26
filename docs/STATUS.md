@@ -14,6 +14,7 @@
 | 2 Agent 编排 | ✅ 完成 | 2026-09-25 | 真实面试 4 轮走通：开场→出题→追问×2→收尾；模型自主调用 2 个工具；状态机全程正确 |
 | 2.5 最小前端 | ✅ 完成 | 2026-09-25 | 用户要求提前：单文件联调页 static/index.html，登录→会话→聊天→结束全流程可点 |
 | 2.6 前端重构 | ✅ 完成 | 2026-09-26 | Vue3+Vite+Element Plus 重构为 ZCode 风格暗色 UI；登录→会话→聊天→结束全流程截图自查通过 |
+| 3 SSE 流式 | ✅ 完成 | 2026-09-26 | 浏览器两轮流式闭环；重连三路径（内容中/思考中/已完成）实测不丢不重；409 守卫、心跳、首 token 埋点通过 |
 | 3 SSE 流式 | ⬜ 未开始 | — | — |
 | 4 RAG 管线 | ⬜ 未开始 | — | — |
 | 5 MQ 异步报告 | ⬜ 未开始 | — | — |
@@ -134,10 +135,43 @@ java -jar target/ai-interviewer-0.1.0-SNAPSHOT.jar
 
 ---
 
-## 7. 下一步：阶段 3（SSE 流式，W3）
+## 7. 已完成：阶段 3（SSE 流式，W3）
 
-1. `SseEmitter` + 专用异步线程池 + 心跳；事件协议 `delta/done/error`，id=消息 seq
-2. Spring AI `.stream()` 流式接入生成链路；首 token 延迟埋点（Micrometer）
-3. Last-Event-ID 断线续传（复用 afterSeq 增量路径）
-4. 前端：打字机效果 + EventSource 重连（或在此评估替换开源 chat UI）
-5. CORS（若前后端分离部署）
+### 交付内容
+
+- **事件协议**：`delta`（增量追加）/ `full-delta`（累计快照，**替换语义**，重连不丢不重的关键）/ `done`（终稿消息 + 状态机状态）/ `error`（可读失败原因）；流式期事件 id 一律为**用户消息 seq**，助手消息真实 seq 随 done 下发
+- **接口变化**：`POST /messages` 改为落库用户消息 + 异步触发生成后**立即返回用户消息**（含真实 seq）；新增 `GET /messages/stream?afterSeq=`（SseEmitter，超时 5min）；`stream-enabled=false` 可整体回退阶段 2 同步路径
+- **`service/InterviewStreamService`**：会话级 in-flight 注册表（生成中再发言 409）+ 订阅者广播 + 快照回放；同一 Generation 的所有 emitter 写操作在锁内串行（SseEmitter 不支持并发写）；15s 心跳 comment 防代理断连
+- **Agent 流式化**：状态机守卫抽出 `PlannedAction` 同步/流式共用；生成侧 `.stream()` + tools（Spring AI 1.0 托管流式工具循环），分片间超时 180s；完成后 persist → updatePhase → done（前端刷新标签时新状态已生效）
+- **鉴权**：EventSource 无法带 Header，仅 `/stream` 端点接受 `token` 查询参数（AuthInterceptor）
+- **埋点**：Micrometer `interview.first.token.latency`（生成起点→首增量）、`interview.generation.errors`
+- **前端**：EventSource + rAF 合帧打字机 + 光标动画；full-delta 整段替换；done 后刷新终稿与状态标签；网络抖动靠浏览器自动重连（Last-Event-ID），服务端拒绝才提示
+
+### 验证记录（2026-09-26，qwen3.7-plus 真实流式）
+
+| # | 用例 | 结果 |
+|---|---|---|
+| 1 | POST 立即返回用户消息（真实 seq），生成中再发言 40900 | ✅ |
+| 2 | 实时流：delta 16 段拼接 == done 终稿（110 字符），不丢不重 | ✅ |
+| 3 | 内容中途重连：full-delta 快照（终稿前缀）+ 后续增量 == 终稿 | ✅ |
+| 4 | 思考期重连：并入直播拿剩余增量；完成后重连：afterSeq 库回放 done | ✅ |
+| 5 | SSE 载荷字节级 UTF-8 正确（od 验证） | ✅ |
+| 6 | 浏览器两轮流式闭环：发送→思考→打字机→终稿→状态标签刷新（截图） | ✅ |
+| 7 | /actuator/prometheus 首token指标有数（8 次，均值 ~24s，思维链模型所致） | ✅ |
+
+### 已知问题 / 有意取舍
+
+- **首 token 延迟 ~24s**：qwen3.7-plus 思维链阶段无内容分片（reasoning_content 不走 content），SSE 只优化了答案展开段（~2-6s 流完）；`enable_thinking:false` 注入仍是调优备选
+- 流式 usage 依赖端点回传，缺失时按中文密度粗估（chars/2）
+- 应用重启丢失 in-flight 生成（内存态）：用户消息已落库，重发即可；W6 稳定性范围
+- 多轮漏看的已持久化消息经 stream 重连会按 done 逐条回放（真实前端不会出现：一次只挂一轮流）
+
+---
+
+## 8. 下一步：阶段 4（RAG 管线，W4）
+
+1. 简历上传（PDF/DOCX ≤10MB）→ Tika 解析 → 自研结构感知分块 → text-embedding-v4(1024维) → SimpleVectorStore（JSON 落盘）
+2. 题库种子（~160 题 JSON 入库，topic/difficulty 元数据）→ searchQuestionBank 真实现（签名不变）
+3. extractResumePoints 真实现（按 userId+topic 检索简历块，工具改每生成实例化）
+4. 生成链路注入召回资料 + gte-rerank-v2 重排 + citations 引用溯源（MessageResponse 加字段）
+5. 前端：上传入口、简历 chip、citations 折叠块；`interview.rag.enabled` 开关
