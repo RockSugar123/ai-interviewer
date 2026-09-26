@@ -1,6 +1,7 @@
 package com.aiinterviewer.service;
 
 import com.aiinterviewer.dto.MessageResponse;
+import com.aiinterviewer.infra.limiter.LlmRateLimiter;
 import com.aiinterviewer.infra.persistence.entity.InterviewMessage;
 import com.aiinterviewer.infra.persistence.entity.InterviewSession;
 import com.aiinterviewer.infra.persistence.mapper.InterviewMessageMapper;
@@ -45,6 +46,7 @@ public class ChatContextService {
     private final StringRedisTemplate redis;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate transactionTemplate;
+    private final LlmRateLimiter rateLimiter;
 
     /** 用户发言：role 固定 USER，token 粗估（阶段 2 起以 LLM usage 为准）。
      * 已结束会话不再拒收：发消息即自动续场（persistMessage 会把状态翻回 IN_PROGRESS，Agent 按 DONE 识别重开）。 */
@@ -53,9 +55,13 @@ public class ChatContextService {
         return persistMessage(sessionId, InterviewMessage.ROLE_USER, content, content.length(), null);
     }
 
-    /** 阶段 2 Agent 写入 ASSISTANT 消息的入口（tokenCount 取 LLM 响应 usage；citations 为 RAG 引用，可空） */
+    /** 阶段 2 Agent 写入 ASSISTANT 消息的入口（tokenCount 取 LLM 响应 usage；citations 为 RAG 引用，可空）。
+     * 阶段 6 起 token 记入全局日配额计数（FR-16 成本硬上限的数据来源）。 */
     public MessageResponse writeAssistant(long sessionId, String content, int tokenCount,
                                           List<com.aiinterviewer.dto.Citation> citations) {
+        if (tokenCount > 0) {
+            rateLimiter.recordTokens(tokenCount);
+        }
         return persistMessage(sessionId, InterviewMessage.ROLE_ASSISTANT, content, tokenCount, citations);
     }
 

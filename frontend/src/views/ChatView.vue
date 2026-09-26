@@ -354,7 +354,11 @@ function onKeydown(e) {
   }
 }
 
-/* ---------- 结束 / 删除 / 退出 ---------- */
+/* ---------- 结束 / 报告 / 删除 / 退出 ---------- */
+function goReport() {
+  location.hash = `#/report/${activeId.value}`
+}
+
 async function finishInterview() {
   try {
     await ElMessageBox.confirm('结束后面试官将给出总结与建议，确定结束本场面试？', '结束面试', {
@@ -475,7 +479,10 @@ onMounted(loadSessions)
           <el-tag size="small" :type="finished ? 'info' : 'primary'" effect="plain" round>
             {{ STATE_LABEL[activeSession.agentState] || '进行中' }}
           </el-tag>
-          <el-button v-if="!finished" class="finish-btn" size="small" round plain @click="finishInterview">
+          <el-button v-if="finished" class="finish-btn" size="small" round plain @click="goReport">
+            查看报告
+          </el-button>
+          <el-button v-else class="finish-btn" size="small" round plain @click="finishInterview">
             结束面试
           </el-button>
         </header>

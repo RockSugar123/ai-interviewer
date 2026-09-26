@@ -77,3 +77,9 @@ export const messageApi = {
   streamUrl: (id, afterSeq) =>
     `/api/sessions/${id}/messages/stream?afterSeq=${afterSeq}&token=${encodeURIComponent(localStorage.getItem('token') || '')}`
 }
+
+export const reportApi = {
+  // 阶段 5：报告经 MQ 异步生成，PENDING/RUNNING 状态需前端轮询
+  get: (id) => request(`/sessions/${id}/report`),
+  retry: (id) => request(`/sessions/${id}/report/retry`, { method: 'POST' })
+}

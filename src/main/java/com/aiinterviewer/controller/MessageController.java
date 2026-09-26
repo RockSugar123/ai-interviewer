@@ -5,6 +5,7 @@ import com.aiinterviewer.agent.InterviewAgentProperties;
 import com.aiinterviewer.common.ApiResponse;
 import com.aiinterviewer.dto.MessageResponse;
 import com.aiinterviewer.dto.SendMessageRequest;
+import com.aiinterviewer.infra.limiter.LlmRateLimiter;
 import com.aiinterviewer.infra.web.AuthInterceptor;
 import com.aiinterviewer.service.ChatContextService;
 import com.aiinterviewer.service.InterviewStreamService;
@@ -32,16 +33,19 @@ public class MessageController {
     private final InterviewAgent interviewAgent;
     private final InterviewStreamService streamService;
     private final InterviewAgentProperties agentProperties;
+    private final LlmRateLimiter rateLimiter;
 
     /**
      * 发言（W3 起异步流式）：用户消息落库并触发异步生成后立即返回该条用户消息；
      * 面试官回复经 GET /stream（SSE）推送。stream-enabled=false 时回退同步整段路径。
+     * 阶段 6 起：发言前过 FR-16 限流（用户级 QPS 令牌桶 + 全局 token 日配额），LLM 调用的唯一用户入口在此。
      */
     @PostMapping
     public ApiResponse<MessageResponse> send(@PathVariable Long sessionId,
                                              @Valid @RequestBody SendMessageRequest req,
                                              HttpServletRequest request) {
         long userId = AuthInterceptor.currentUserId(request);
+        rateLimiter.checkSpeakAllowed(userId);
         MessageResponse userMsg = chatContextService.append(sessionId, userId, req.content());
         if (!agentProperties.streamEnabled()) {
             return ApiResponse.ok(interviewAgent.reply(sessionId, userId));

@@ -11,6 +11,7 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -25,6 +26,7 @@ public class SessionService {
 
     private final InterviewSessionMapper sessionMapper;
     private final ResumeService resumeService;
+    private final ApplicationEventPublisher eventPublisher;
 
     @Transactional
     public SessionDetailResponse create(long userId, CreateSessionRequest req) {
@@ -63,7 +65,7 @@ public class SessionService {
         log.info("会话删除 [sessionId={} userId={}]", sessionId, userId);
     }
 
-    /** 显式结束面试（Agent 决策收尾也会走同一状态） */
+    /** 显式结束面试（Agent 决策收尾也会走同一状态）。事务提交后发结束事件 → ReportService 发 MQ 生成报告 */
     @Transactional
     public SessionDetailResponse finish(long sessionId, long userId) {
         getOwned(sessionId, userId);
@@ -72,6 +74,7 @@ public class SessionService {
         update.setStatus(InterviewSession.STATUS_FINISHED);
         update.setAgentState(InterviewSession.AGENT_DONE);
         sessionMapper.updateById(update);
+        eventPublisher.publishEvent(new InterviewFinishedEvent(sessionId, userId, System.currentTimeMillis()));
         log.info("会话结束 [sessionId={} userId={}]", sessionId, userId);
         return detail(sessionId, userId);
     }

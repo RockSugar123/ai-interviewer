@@ -10,7 +10,6 @@ import org.springframework.ai.vectorstore.SimpleVectorStore;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.filter.FilterExpressionTextParser;
 import org.springframework.core.io.FileSystemResource;
-import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
 import java.io.File;
@@ -21,8 +20,8 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 索引写入侧（FR-10/11）：简历异步索引（Tika 解析 → 结构感知分块 → embedding → 向量库）
- * 与题库播种。所有写入在单线程 ragIndexExecutor 串行执行，规避并发写与落盘竞争。
+ * 索引写入侧（FR-10/11）：简历索引（Tika 解析 → 结构感知分块 → embedding → 向量库）与题库播种。
+ * 阶段 5 起简历索引由 MQ 驱动（ResumeIndexListener，单线程串行消费），MQ 停用时由 ResumeService 同步直调。
  * 失败一律落 resume_file.error_msg，不静默（吞异常=欠债）。
  */
 @Slf4j
@@ -37,9 +36,16 @@ public class RagIndexService {
     private final ResumeFileMapper resumeFileMapper;
     private final RagProperties props;
 
-    /** 简历索引（异步，上传后触发）：PENDING → RUNNING → DONE/FAILED */
-    @Async("ragIndexExecutor")
-    public void indexResumeAsync(Long resumeFileId) {
+    /**
+     * 简历索引：PENDING → RUNNING → DONE/FAILED。
+     * 失败分类（FR-15 配套）：确定性失败（文件不存在/解析为空等 IllegalStateException）落 FAILED 后正常返回
+     * （消费者 ACK，MQ 不重试——重试无意义）；其余异常（embedding 网络超时/限流等瞬时失败）落 FAILED 后抛出
+     * （消费者异常 → RocketMQ 退避重试 → 耗尽进死信，用户可重新上传或经手动触发恢复）。
+     *
+     * synchronized：消费线程默认 20，SimpleVectorStore 并发写/落盘必须串行（与 seedQuestionBankIfEmpty 同风格，
+     * 单机部署进程内锁足够；starter 2.3.1 注解不支持设置 consumeThreadMin，不能走"单线程消费"方案）。
+     */
+    public synchronized void indexResume(Long resumeFileId) {
         ResumeFile file = resumeFileMapper.selectById(resumeFileId);
         if (file == null) {
             log.warn("[RAG] 简历记录不存在，跳过索引 [id={}]", resumeFileId);
@@ -74,10 +80,16 @@ public class RagIndexService {
             saveStore();
             updateStatus(file, ResumeFile.STATUS_DONE, null);
             log.info("[RAG] 简历索引完成 [id={} chunks={} chars={}]", file.getId(), chunks.size(), text.length());
+        } catch (IllegalStateException e) {
+            // 确定性失败：重试无意义，落 FAILED 即 ACK
+            updateStatus(file, ResumeFile.STATUS_FAILED, abbreviate(e.getMessage()));
+            log.error("[RAG] 简历索引确定性失败（不重试） [id={} path={}]", file.getId(), file.getFilePath(), e);
         } catch (Exception e) {
+            // 瞬时失败：落 FAILED 后抛出 → MQ 退避重试
             String reason = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
             updateStatus(file, ResumeFile.STATUS_FAILED, abbreviate(reason));
-            log.error("[RAG] 简历索引失败 [id={} path={}]", file.getId(), file.getFilePath(), e);
+            log.error("[RAG] 简历索引瞬时失败（MQ 将退避重试） [id={} path={}]", file.getId(), file.getFilePath(), e);
+            throw new IllegalStateException("简历索引失败（将由 MQ 退避重试）: " + reason, e);
         }
     }
 
