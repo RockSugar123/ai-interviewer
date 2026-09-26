@@ -16,17 +16,25 @@ import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.stereotype.Service;
 
+import java.time.Duration;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 
 /**
  * 面试编排器（FR-4 核心，自研决策层）：
  * 上下文组装（FR-3 预算裁剪）→ 决策（LLM 结构化输出）→ 状态机守卫 → 生成（工具调用循环由 Spring AI 托管，FR-5）→ 状态推进与落库。
  * 决策调用失败时安全降级为 NEXT_QUESTION，主链路不中断（失败兜底原则）。
+ * W3 起生成侧支持流式（replyStreaming，逐 token 回调），守卫与状态推进逻辑经 PlannedAction 与同步路径共用。
  */
 @Slf4j
 @Service
 public class InterviewAgent {
+
+    /** 开场不走决策层，直接以出题动作生成开场白 + 第一题 */
+    private static final PlannedAction OPENING_PLAN = new PlannedAction(
+            AgentAction.NEXT_QUESTION, AgentPrompts.OPENING_RULE, InterviewPhase.QUESTIONING, 0, 1, false);
 
     private final ChatClient chatClient;
     private final SessionService sessionService;
@@ -46,7 +54,7 @@ public class InterviewAgent {
         this.props = props;
     }
 
-    /** 生成面试官回复。调用前用户消息必须已入库（controller 已 append），本方法从上下文读取。 */
+    /** 生成面试官回复（同步整段版，stream-enabled=false 时保留）。调用前用户消息必须已入库。 */
     public MessageResponse reply(long sessionId, long userId) {
         InterviewSession session = sessionService.getOwned(sessionId, userId);
         if (InterviewSession.STATUS_FINISHED.equals(session.getStatus())) {
@@ -58,19 +66,40 @@ public class InterviewAgent {
 
         if (phase == null) {
             log.info("[Agent] 开场 session={}", sessionId);
-            return runOpening(session, jdText, transcript);
+            return finishPlan(sessionId, jdText, transcript, OPENING_PLAN);
         }
         AgentDecision decision = decide(phase, session, jdText, transcript);
-        return runAction(session, phase, decision, jdText, transcript);
+        PlannedAction plan = planAction(sessionId, phase, decision,
+                nz(session.getProbeCount()), nz(session.getQuestionCount()));
+        return finishPlan(sessionId, jdText, transcript, plan);
     }
 
-    // ---------- 开场 ----------
+    /** 流式版主链路（W3）：决策与守卫同同步路径，生成改为逐 token 回调；结束后落库 + 推进状态机。 */
+    public MessageResponse replyStreaming(long sessionId, long userId, Consumer<String> onDelta) {
+        InterviewSession session = sessionService.getOwned(sessionId, userId);
+        if (InterviewSession.STATUS_FINISHED.equals(session.getStatus())) {
+            throw new BusinessException(ErrorCode.BAD_REQUEST, "面试已结束，不能再对话");
+        }
+        InterviewPhase phase = InterviewPhase.from(session.getAgentState());
+        String jdText = session.getJdText();
+        String transcript = buildTranscript(sessionId, userId);
 
-    private MessageResponse runOpening(InterviewSession session, String jdText, String transcript) {
-        String input = AgentPrompts.generationInput(AgentPrompts.OPENING_RULE, jdText, transcript);
-        MessageResponse reply = generateAndPersist(session.getId(), AgentPrompts.INTERVIEWER_SYSTEM,
-                input, "OPENING");
-        updatePhase(session.getId(), InterviewPhase.QUESTIONING, 0, 1, false);
+        PlannedAction plan;
+        if (phase == null) {
+            log.info("[Agent] 开场（流式） session={}", sessionId);
+            plan = OPENING_PLAN;
+        } else {
+            AgentDecision decision = decide(phase, session, jdText, transcript);
+            plan = planAction(sessionId, phase, decision,
+                    nz(session.getProbeCount()), nz(session.getQuestionCount()));
+        }
+        String input = AgentPrompts.generationInput(plan.instruction(), jdText, transcript);
+        MessageResponse reply = generateStreaming(sessionId, AgentPrompts.INTERVIEWER_SYSTEM,
+                input, plan, onDelta);
+        updatePhase(sessionId, plan.nextPhase(), plan.nextProbe(), plan.nextQuestion(), plan.finish());
+        if (plan.finish()) {
+            log.info("[Agent] 面试结束 session={}", sessionId);
+        }
         return reply;
     }
 
@@ -101,14 +130,15 @@ public class InterviewAgent {
 
     // ---------- 守卫 + 生成 + 状态推进 ----------
 
-    private MessageResponse runAction(InterviewSession session, InterviewPhase phase,
-                                      AgentDecision decision, String jdText, String transcript) {
-        long sessionId = session.getId();
-        int probeCount = nz(session.getProbeCount());
-        int questionCount = nz(session.getQuestionCount());
-        AgentAction action = decision.normalizedAction();
+    /** 动作规划结果：守卫钳制后的动作 + 生成指令 + 状态推进参数（同步/流式共用） */
+    private record PlannedAction(AgentAction action, String instruction, InterviewPhase nextPhase,
+                                 int nextProbe, int nextQuestion, boolean finish) {
+    }
 
-        // 状态机守卫：非法或越限的决策被钳制到安全动作
+    /** 状态机守卫：非法或越限的决策被钳制到安全动作 */
+    private PlannedAction planAction(long sessionId, InterviewPhase phase, AgentDecision decision,
+                                     int probeCount, int questionCount) {
+        AgentAction action = decision.normalizedAction();
         if (action == AgentAction.PROBE && probeCount >= props.maxProbesPerQuestion()) {
             log.warn("[Agent] 守卫：追问达上限({})，强制切话题 session={}", props.maxProbesPerQuestion(), sessionId);
             action = AgentAction.SWITCH_TOPIC;
@@ -122,43 +152,25 @@ public class InterviewAgent {
             log.warn("[Agent] 守卫：CLOSING 阶段仅允许收尾 session={}", sessionId);
             action = AgentAction.WRAP_UP;
         }
+        return switch (action) {
+            case PROBE -> new PlannedAction(action, AgentPrompts.INSTR_PROBE,
+                    InterviewPhase.PROBING, probeCount + 1, questionCount, false);
+            case SWITCH_TOPIC -> new PlannedAction(action, AgentPrompts.INSTR_SWITCH_TOPIC,
+                    InterviewPhase.QUESTIONING, 0, questionCount + 1, false);
+            case WRAP_UP -> new PlannedAction(action, AgentPrompts.INSTR_WRAP_UP,
+                    InterviewPhase.DONE, probeCount, questionCount, true);
+            case NEXT_QUESTION -> new PlannedAction(action, AgentPrompts.INSTR_NEXT_QUESTION,
+                    InterviewPhase.QUESTIONING, 0, questionCount + 1, false);
+        };
+    }
 
-        String instruction;
-        InterviewPhase nextPhase;
-        int nextProbe = probeCount;
-        int nextQuestion = questionCount;
-        boolean finish = false;
-
-        switch (action) {
-            case PROBE -> {
-                instruction = AgentPrompts.INSTR_PROBE;
-                nextPhase = InterviewPhase.PROBING;
-                nextProbe = probeCount + 1;
-            }
-            case SWITCH_TOPIC -> {
-                instruction = AgentPrompts.INSTR_SWITCH_TOPIC;
-                nextPhase = InterviewPhase.QUESTIONING;
-                nextProbe = 0;
-                nextQuestion = questionCount + 1;
-            }
-            case WRAP_UP -> {
-                instruction = AgentPrompts.INSTR_WRAP_UP;
-                nextPhase = InterviewPhase.DONE;
-                finish = true;
-            }
-            default -> { // NEXT_QUESTION
-                instruction = AgentPrompts.INSTR_NEXT_QUESTION;
-                nextPhase = InterviewPhase.QUESTIONING;
-                nextProbe = 0;
-                nextQuestion = questionCount + 1;
-            }
-        }
-
-        String input = AgentPrompts.generationInput(instruction, jdText, transcript);
+    /** 同步路径：按规划生成并落库，推进状态 */
+    private MessageResponse finishPlan(long sessionId, String jdText, String transcript, PlannedAction plan) {
+        String input = AgentPrompts.generationInput(plan.instruction(), jdText, transcript);
         MessageResponse reply = generateAndPersist(sessionId, AgentPrompts.INTERVIEWER_SYSTEM,
-                input, action.name());
-        updatePhase(sessionId, nextPhase, nextProbe, nextQuestion, finish);
-        if (finish) {
+                input, plan.action().name());
+        updatePhase(sessionId, plan.nextPhase(), plan.nextProbe(), plan.nextQuestion(), plan.finish());
+        if (plan.finish()) {
             log.info("[Agent] 面试结束 session={}", sessionId);
         }
         return reply;
@@ -183,6 +195,62 @@ public class InterviewAgent {
         log.info("[Agent] 生成完成 session={} tag={} tokens={} chars={}", sessionId, tag, totalTokens,
                 text == null ? 0 : text.length());
         return chatContextService.writeAssistant(sessionId, text, totalTokens);
+    }
+
+    /** 流式生成：逐 token 回调（失败/超时抛异常，由上层 error 事件兜底），完成后落库并返回终稿 */
+    private MessageResponse generateStreaming(long sessionId, String system, String user,
+                                              PlannedAction plan, Consumer<String> onDelta) {
+        StringBuilder text = new StringBuilder();
+        AtomicReference<Number> usageTokens = new AtomicReference<>();
+        chatClient.prompt()
+                .system(system)
+                .user(user)
+                .options(OpenAiChatOptions.builder().temperature(props.generationTemperature()).build())
+                .tools(tools)
+                .stream()
+                .chatClientResponse()
+                .doOnNext(ccr -> {
+                    captureUsage(ccr, usageTokens);
+                    String delta = extractDelta(ccr);
+                    if (!delta.isEmpty()) {
+                        text.append(delta);
+                        onDelta.accept(delta);
+                    }
+                })
+                .timeout(Duration.ofSeconds(props.generationTimeoutSeconds()))
+                .blockLast();
+        String content = text.toString();
+        if (content.isBlank()) {
+            throw new IllegalStateException("流式生成结果为空");
+        }
+        int totalTokens = usageTokens.get() != null
+                ? usageTokens.get().intValue()
+                : (int) Math.round(content.length() / 2.0); // 流式 usage 缺失时按中文密度粗估
+        log.info("[Agent] 流式生成完成 session={} tag={} tokens={} chars={}",
+                sessionId, plan.action(), totalTokens, content.length());
+        return chatContextService.writeAssistant(sessionId, content, totalTokens);
+    }
+
+    /** 流式各分片可能缺 usage；取首个非空 totalTokens（通常在最后一个分片） */
+    private static void captureUsage(ChatClientResponse ccr, AtomicReference<Number> sink) {
+        if (sink.get() != null || ccr == null || ccr.chatResponse() == null
+                || ccr.chatResponse().getMetadata() == null
+                || ccr.chatResponse().getMetadata().getUsage() == null) {
+            return;
+        }
+        Number total = ccr.chatResponse().getMetadata().getUsage().getTotalTokens();
+        if (total != null && total.intValue() > 0) {
+            sink.set(total);
+        }
+    }
+
+    private static String extractDelta(ChatClientResponse ccr) {
+        if (ccr == null || ccr.chatResponse() == null || ccr.chatResponse().getResult() == null
+                || ccr.chatResponse().getResult().getOutput() == null) {
+            return "";
+        }
+        String t = ccr.chatResponse().getResult().getOutput().getText();
+        return t == null ? "" : t;
     }
 
     // ---------- 状态与上下文 ----------

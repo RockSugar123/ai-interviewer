@@ -9,5 +9,9 @@ public record InterviewAgentProperties(
         @DefaultValue("10") int maxQuestions,
         @DefaultValue("6000") int maxContextChars,
         @DefaultValue("0.2") double decisionTemperature,
-        @DefaultValue("0.7") double generationTemperature) {
+        @DefaultValue("0.7") double generationTemperature,
+        /** W3 流式总开关：false 时回退阶段 2 的同步整段路径（LLM 流式异常时的整体兜底） */
+        @DefaultValue("true") boolean streamEnabled,
+        /** 流式生成两个信号间的最大间隔（思维链阶段也有分片流动，超隔视为卡死） */
+        @DefaultValue("180") int generationTimeoutSeconds) {
 }
