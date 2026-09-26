@@ -2,9 +2,12 @@ package com.aiinterviewer.rag;
 
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.http.client.ClientHttpRequestFactoryBuilder;
+import org.springframework.boot.http.client.ClientHttpRequestFactorySettings;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -27,9 +30,15 @@ public class RerankClient {
                         @Value("${spring.ai.openai.api-key}") String apiKey,
                         @Value("${interview.rag.rerank-enabled:true}") boolean enabled) {
         this.enabled = enabled;
+        // 默认请求工厂无超时：DashScope 挂起会占死生成线程，try-catch 接不住"不返回"的调用，
+        // 必须显式超时让 rerank 走快速失败 → 降级向量序
         this.restClient = RestClient.builder()
                 .baseUrl(baseUrl)
                 .defaultHeader("Authorization", "Bearer " + apiKey)
+                .requestFactory(ClientHttpRequestFactoryBuilder.detect().build(
+                        ClientHttpRequestFactorySettings.defaults()
+                                .withConnectTimeout(Duration.ofSeconds(3))
+                                .withReadTimeout(Duration.ofSeconds(10))))
                 .build();
     }
 
