@@ -87,8 +87,10 @@ public class InterviewAgent {
                 session.getResumeFileId(), plan, tools);
     }
 
-    /** 流式版主链路（W3）：决策与守卫同同步路径，生成改为逐 token 回调；结束后落库 + 推进状态机。 */
-    public MessageResponse replyStreaming(long sessionId, long userId, Consumer<String> onDelta) {
+    /** 流式版主链路（W3）：决策与守卫同同步路径，生成改为逐 token 回调；结束后落库 + 推进状态机。
+     *  onThink 回调逐段推送思维链（qwen reasoning_content，Spring AI 1.1+ 经 AssistantMessage metadata 透出）。 */
+    public MessageResponse replyStreaming(long sessionId, long userId, Consumer<String> onDelta,
+                                          Consumer<String> onThink) {
         InterviewSession session = sessionService.getOwned(sessionId, userId);
         if (InterviewSession.STATUS_FINISHED.equals(session.getStatus())) {
             throw new BusinessException(ErrorCode.BAD_REQUEST, "面试已结束，不能再对话");
@@ -112,7 +114,7 @@ public class InterviewAgent {
         }
         GenerateInput input = assembleInput(session.getResumeFileId(), jdText, transcript, plan, decisionTopic);
         MessageResponse reply = generateStreaming(sessionId, AgentPrompts.INTERVIEWER_SYSTEM,
-                input.promptText(), plan, tools, input.citations(), onDelta);
+                input.promptText(), plan, tools, input.citations(), onDelta, onThink);
         updatePhase(sessionId, plan.nextPhase(), plan.nextProbe(), plan.nextQuestion(), plan.finish());
         if (plan.finish()) {
             log.info("[Agent] 面试结束 session={}", sessionId);
@@ -262,7 +264,8 @@ public class InterviewAgent {
     /** 流式生成：逐 token 回调（失败/超时抛异常，由上层 error 事件兜底），完成后落库并返回终稿 */
     private MessageResponse generateStreaming(long sessionId, String system, String user,
                                               PlannedAction plan, InterviewTools tools,
-                                              List<Citation> citations, Consumer<String> onDelta) {
+                                              List<Citation> citations, Consumer<String> onDelta,
+                                              Consumer<String> onThink) {
         StringBuilder text = new StringBuilder();
         AtomicReference<Number> usageTokens = new AtomicReference<>();
         chatClient.prompt()
@@ -278,6 +281,10 @@ public class InterviewAgent {
                     if (!delta.isEmpty()) {
                         text.append(delta);
                         onDelta.accept(delta);
+                    }
+                    String think = extractThink(ccr);
+                    if (!think.isEmpty()) {
+                        onThink.accept(think);
                     }
                 })
                 .timeout(Duration.ofSeconds(props.generationTimeoutSeconds()))
@@ -314,6 +321,16 @@ public class InterviewAgent {
         }
         String t = ccr.chatResponse().getResult().getOutput().getText();
         return t == null ? "" : t;
+    }
+
+    /** 思维链分片（Spring AI 1.1+：reasoning 经 AssistantMessage metadata 的 reasoningContent 键透出） */
+    private static String extractThink(ChatClientResponse ccr) {
+        if (ccr == null || ccr.chatResponse() == null || ccr.chatResponse().getResult() == null
+                || ccr.chatResponse().getResult().getOutput() == null) {
+            return "";
+        }
+        Object think = ccr.chatResponse().getResult().getOutput().getMetadata().get("reasoningContent");
+        return think instanceof String s ? s : "";
     }
 
     // ---------- 状态与上下文 ----------

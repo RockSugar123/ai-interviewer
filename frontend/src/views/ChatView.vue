@@ -142,7 +142,7 @@ async function createSession() {
   }
 }
 
-/* ---------- 发送与流式回复（W3 SSE） ---------- */
+/* ---------- 发送与流式回复（W3 SSE + 思考链） ---------- */
 const draft = ref('')
 const thinking = ref(false)
 const thinkSeconds = ref(0)
@@ -152,6 +152,12 @@ const streamText = ref('')
 let eventSource = null
 let streamBuf = ''
 let pendingRaf = null
+/* 思考链（think/full-think 事件；不落库，随 done 全文下发挂到消息上供折叠回看） */
+const thinkText = ref('')
+let thinkBuf = ''
+const thinkOpen = ref(true)
+const answerStarted = ref(false)
+const thinkBodyRef = ref(null)
 
 const canSend = computed(
   () => !!draft.value.trim() && !!activeId.value && !thinking.value && !finished.value
@@ -184,18 +190,14 @@ onBeforeUnmount(() => {
   closeStream()
 })
 
-function flushStreamBuf() {
-  pendingRaf = null
-  streamText.value = streamBuf
-  scrollToBottom()
-}
-
 function scrollToBottom() {
   // 等内容完成一轮布局后再滚动，否则会停在旧高度上
   nextTick(() => {
     setTimeout(() => {
       try {
         scrollRef.value?.setScrollTop(999999)
+        const body = thinkBodyRef.value
+        if (body) body.scrollTop = body.scrollHeight
       } catch {
         /* 容器尚未挂载时忽略 */
       }
@@ -203,32 +205,67 @@ function scrollToBottom() {
   })
 }
 
-/** 订阅面试官回复流。delta 追加（rAF 合帧渲染），full-delta 整段替换（断线重连快照），done 落定终稿 */
-function attachStream(afterSeq) {
+function flushStream() {
+  pendingRaf = null
+  thinkText.value = thinkBuf
+  streamText.value = streamBuf
+  scrollToBottom()
+}
+
+function scheduleFlush() {
+  if (!pendingRaf) pendingRaf = requestAnimationFrame(flushStream)
+}
+
+function resetStreamState() {
   streaming.value = true
   streamText.value = ''
   streamBuf = ''
+  thinkText.value = ''
+  thinkBuf = ''
+  thinkOpen.value = true
+  answerStarted.value = false
+}
+
+/** 订阅面试官回复流。think=思维链增量；delta 追加（rAF 合帧渲染）；full-* 断线重连快照；done 落定终稿 */
+function attachStream(afterSeq) {
+  resetStreamState()
   const es = new EventSource(messageApi.streamUrl(activeId.value, afterSeq))
   eventSource = es
+  es.addEventListener('think', (e) => {
+    thinkBuf += JSON.parse(e.data).text
+    scheduleFlush()
+  })
+  es.addEventListener('full-think', (e) => {
+    thinkBuf = JSON.parse(e.data).text
+    scheduleFlush()
+  })
   es.addEventListener('delta', (e) => {
+    if (!answerStarted.value) {
+      // 答案开始输出：思考阶段结束，面板折叠保留可回看
+      answerStarted.value = true
+      thinkOpen.value = false
+    }
     streamBuf += JSON.parse(e.data).text
-    if (!pendingRaf) pendingRaf = requestAnimationFrame(flushStreamBuf)
+    scheduleFlush()
   })
   es.addEventListener('full-delta', (e) => {
+    answerStarted.value = true
+    thinkOpen.value = false
     streamBuf = JSON.parse(e.data).text
-    if (pendingRaf) {
-      cancelAnimationFrame(pendingRaf)
-      pendingRaf = null
-    }
-    streamText.value = streamBuf
-    scrollToBottom()
+    scheduleFlush()
   })
   es.addEventListener('done', (e) => {
     const payload = JSON.parse(e.data)
     closeStream()
     streaming.value = false
     stopThinking()
-    if (payload.message) messages.value.push(payload.message)
+    if (payload.message) {
+      // 思考链为一次性随文数据（服务端不落库），仅当前会话内可回看
+      payload.message._think = payload.thinking || null
+      payload.message._thinkSeconds = thinkSeconds.value
+      payload.message._thinkOpen = false
+      messages.value.push(payload.message)
+    }
     if (payload.agentState && activeSession.value && activeSession.value.id === activeId.value) {
       activeSession.value.agentState = payload.agentState
       activeSession.value.status = payload.status
@@ -446,6 +483,13 @@ onMounted(loadSessions)
             <div v-for="m in messages" :key="m.seq" class="msg" :class="m.role === 'USER' ? 'me' : 'ai'">
               <div v-if="m.role !== 'USER'" class="ai-avatar">面</div>
               <div class="msg-main">
+                <div v-if="m.role !== 'USER' && m._think" class="think-panel">
+                  <button class="think-toggle" type="button" @click="m._thinkOpen = !m._thinkOpen">
+                    <span class="think-label">已深度思考（{{ m._thinkSeconds || 0 }}s）</span>
+                    <span class="think-caret">{{ m._thinkOpen ? '▾' : '▸' }}</span>
+                  </button>
+                  <pre v-if="m._thinkOpen" class="think-body">{{ m._think }}</pre>
+                </div>
                 <div class="bubble">{{ m.content }}</div>
                 <div v-if="m.role !== 'USER' && m.citations && m.citations.length" class="cite-row">
                   <el-tooltip
@@ -461,17 +505,22 @@ onMounted(loadSessions)
               </div>
             </div>
 
-            <div v-if="thinking && !streaming" class="msg ai">
-              <div class="ai-avatar">面</div>
-              <div class="thinking-box">
-                <span class="dots"><i></i><i></i><i></i></span>
-                面试官思考中 · {{ thinkSeconds }}s
-              </div>
-            </div>
-
             <div v-if="streaming" class="msg ai">
               <div class="ai-avatar">面</div>
-              <div class="bubble streaming-bubble">{{ streamText }}<span class="caret"></span></div>
+              <div class="msg-main">
+                <div v-if="thinkText" class="think-panel">
+                  <button class="think-toggle" type="button" @click="thinkOpen = !thinkOpen">
+                    <span class="think-label">{{ answerStarted ? `已深度思考（${thinkSeconds}s）` : '深度思考中…' }}</span>
+                    <span class="think-caret">{{ thinkOpen || !answerStarted ? '▾' : '▸' }}</span>
+                  </button>
+                  <pre v-show="thinkOpen || !answerStarted" ref="thinkBodyRef" class="think-body">{{ thinkText }}</pre>
+                </div>
+                <div v-if="thinking && !answerStarted && !thinkText" class="thinking-box">
+                  <span class="dots"><i></i><i></i><i></i></span>
+                  面试官思考中 · {{ thinkSeconds }}s
+                </div>
+                <div v-if="answerStarted" class="bubble streaming-bubble">{{ streamText }}<span class="caret"></span></div>
+              </div>
             </div>
           </div>
         </el-scrollbar>
@@ -718,6 +767,42 @@ onMounted(loadSessions)
 }
 
 .msg-main { min-width: 0; max-width: 660px; }
+
+/* 思考链面板：流式期间展开滚动，答案开始后折叠可回看 */
+.think-panel { margin-bottom: 6px; }
+
+.think-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-2);
+  font-size: 12px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+
+.think-toggle:hover { color: var(--text-1); border-color: var(--text-2); }
+
+.think-caret { font-size: 10px; opacity: 0.7; }
+
+.think-body {
+  margin: 6px 0 0;
+  padding: 10px 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text-2);
+  font-size: 12.5px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 260px;
+  overflow-y: auto;
+  font-family: inherit;
+}
 
 .cite-row {
   display: flex;
