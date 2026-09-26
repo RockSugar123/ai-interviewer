@@ -15,6 +15,7 @@
 | 2.5 最小前端 | ✅ 完成 | 2026-09-25 | 用户要求提前：单文件联调页 static/index.html，登录→会话→聊天→结束全流程可点 |
 | 2.6 前端重构 | ✅ 完成 | 2026-09-26 | Vue3+Vite+Element Plus 重构为 ZCode 风格暗色 UI；登录→会话→聊天→结束全流程截图自查通过 |
 | 3 SSE 流式 | ✅ 完成 | 2026-09-26 | 浏览器两轮流式闭环；重连三路径（内容中/思考中/已完成）实测不丢不重；409 守卫、心跳、首 token 埋点通过 |
+| 4 RAG 管线 | ✅ 完成 | 2026-09-26 | 简历上传→解析 6 块→真题库 150 题播种；模型按简历原文出题/追问并带 [S1] 引用；rerank 生效；无简历会话隔离回归通过 |
 | 3 SSE 流式 | ⬜ 未开始 | — | — |
 | 4 RAG 管线 | ⬜ 未开始 | — | — |
 | 5 MQ 异步报告 | ⬜ 未开始 | — | — |
@@ -168,10 +169,53 @@ java -jar target/ai-interviewer-0.1.0-SNAPSHOT.jar
 
 ---
 
-## 8. 下一步：阶段 4（RAG 管线，W4）
+## 8. 已完成：阶段 4（RAG 管线，W4）
 
-1. 简历上传（PDF/DOCX ≤10MB）→ Tika 解析 → 自研结构感知分块 → text-embedding-v4(1024维) → SimpleVectorStore（JSON 落盘）
-2. 题库种子（~160 题 JSON 入库，topic/difficulty 元数据）→ searchQuestionBank 真实现（签名不变）
-3. extractResumePoints 真实现（按 userId+topic 检索简历块，工具改每生成实例化）
-4. 生成链路注入召回资料 + gte-rerank-v2 重排 + citations 引用溯源（MessageResponse 加字段）
-5. 前端：上传入口、简历 chip、citations 折叠块；`interview.rag.enabled` 开关
+### 选型（实测定案）
+
+- **Embedding**：DashScope `text-embedding-v4`，1024 维（与聊天模型同 base-url/key，OpenAI 兼容 `/v1/embeddings`，实测通过）
+- **向量库**：Spring AI `SimpleVectorStore`（内存 + JSON 落盘 `data/rag-store.json`）。**本机 Redis 8.6.3 实测无 `FT.*`**（cygwin 构建未带查询引擎），RedisStack 需 VM 另起服务故未采用；千级 chunk 内存余弦足够，VectorStore 接口统一可平移
+- **重排**：DashScope `gte-rerank-v2`（原生 `/api/v1/services/rerank/text-rerank/text-rerank`，同 key；路径/参数踩坑两次后实测通过），失败自动降级向量序
+- **解析**：`spring-ai-tika-document-reader`；**分块**：自研结构感知切分（简历按 section 标题行，超长按句边界切，600-800 字符 overlap 12%）
+- **注**：spring-ai 1.0 起 vectorstore 抽象在独立 artifact `spring-ai-vector-store`
+
+### 交付内容
+
+- **V3 迁移**：`resume_file.error_msg`（解析失败原因可见）+ `interview_message.citations`（引用 JSON）
+- **上传链路**：`POST/GET/DELETE /api/resumes`（PDF/DOC/DOCX ≤10MB，归属校验沿用 404 惯例）→ PENDING→RUNNING→DONE/FAILED（@Async 单线程串行）；重复上传先清旧向量再写
+- **题库种子**：`resources/rag/question-bank.json` 150 题（10 主题×15，含 topic/difficulty），启动播种幂等（已有跳过，实测 28.7s 首播/1.3s 跳过）
+- **工具真实现**（阶段 2 契约兑现）：`searchQuestionBank(topic,difficulty)` 签名不变 = 向量检索+difficulty 过滤；`extractResumePoints(topic?)` 按**会话挂载的 resumeFileId** 检索简历块；InterviewTools 从单例 Bean 改为**每生成按候选人+会话实例化**
+- **生成链路注入**：决策后按"决策主题+对话尾部"检索简历块 top5 → 重排 → `[S1]（简历-项目经历）…` 注入 prompt；回复引用处标注编号；citations 随消息落库并透传前端（悬浮显示原文节选）
+- **会话挂载**：`CreateSessionRequest.resumeFileId`（归属校验）+ 会话详情返回 + 前端"简历"chip；**会话级隔离**：未挂简历的会话不注入简历（回归实测 citations=null）
+- **前端**：新建面试弹窗简历上传+解析状态轮询+下拉选择；AI 气泡下引用 chips（tooltip 原文节选）
+- **开关**：`interview.rag.enabled=false` 时上传/播种/注入/工具全部降级，行为同阶段 3
+
+### 验证记录（2026-09-26，真实简历 + 真实题库）
+
+| # | 用例 | 结果 |
+|---|---|---|
+| 1 | 上传 DOCX 简历 → RUNNING → DONE（Tika 解析 1214 字符 → 结构感知分块 6 块） | ✅ |
+| 2 | 题库播种 150 题（28.7s），重启幂等跳过 + 落盘加载 | ✅ |
+| 3 | 挂简历会话开场：面试官按简历原文出题（Redis Lua 预扣减），回复带 [S1][S3]，citations 指向"简历-项目经历" | ✅ |
+| 4 | PROBE 决策带主题 → 注入 3 块资料 → 追问幂等细节并引用 [S1] | ✅ |
+| 5 | 模型自主调用 searchQuestionBank(topic=计算机网络,difficulty=基础)，出 TCP 三次握手真题 | ✅ |
+| 6 | SWITCH_TOPIC 切"高并发系统设计"，追问 Sentinel（简历原文）引用 [S1] | ✅ |
+| 7 | rerank 修复后无降级告警；无简历会话 citations=null 隔离回归 | ✅ |
+| 8 | 浏览器：简历 chip + 引用 chips 渲染（截图） | ✅ |
+
+### 已知问题 / 有意取舍
+
+- **检索质量依赖简历结构**：无标题的纯文本简历按段落近似切（section 记为"全文"）；扫描件 Tika 解不出文字会 FAILED 并显示原因
+- extractResumePoints 由模型按需调用：注入式参考资料常已覆盖其用途，模型可能不调（属正常）
+- 首启播种约 30s（150 次逐条 embedding）；题库扩充到千题建议改批量 embedding
+- 模型偶尔输出 markdown 粗体星号（如 \*\*TCP\*\*），前端按纯文本渲染未处理——待打磨
+- rerank 与 embedding 计费独立，成本核算时注意（W6 一并做配额）
+
+---
+
+## 9. 下一步：阶段 5（MQ 异步报告，W5）
+
+1. RocketMQ（VM compose 或本机）：面试结束发消息 → 消费者聚合会话 → LLM 生成四维报告 → 落库
+2. **FR-15 三个都真实现**：幂等（uk_session + Redis setnx）、重试（退避 N 次）、死信（DLQ + 补偿查询）
+3. 文档索引任务迁入 MQ（阶段 4 的 @Async 迁移，正好是一次真实改造）
+4. scoreAnswer 真评分启用，报告链路接入；前端报告页

@@ -24,16 +24,21 @@ public class SessionService {
     private static final long MAX_PAGE_SIZE = 50;
 
     private final InterviewSessionMapper sessionMapper;
+    private final ResumeService resumeService;
 
     @Transactional
     public SessionDetailResponse create(long userId, CreateSessionRequest req) {
+        // 简历挂载：归属校验（非本人简历按不存在处理），未传则置空
+        Long resumeFileId = req.resumeFileId() == null ? null
+                : resumeService.getOwned(req.resumeFileId(), userId).getId();
         InterviewSession session = new InterviewSession();
         session.setUserId(userId);
         session.setTitle(req.title() == null || req.title().isBlank() ? "未命名面试" : req.title());
         session.setJdText(req.jdText());
+        session.setResumeFileId(resumeFileId);
         session.setStatus(InterviewSession.STATUS_CREATED);
         sessionMapper.insert(session);
-        log.info("会话创建 [sessionId={} userId={}]", session.getId(), userId);
+        log.info("会话创建 [sessionId={} userId={} resumeFileId={}]", session.getId(), userId, resumeFileId);
         return toDetail(session);
     }
 
@@ -83,6 +88,6 @@ public class SessionService {
     private SessionDetailResponse toDetail(InterviewSession s) {
         return new SessionDetailResponse(s.getId(), s.getTitle(), s.getJdText(),
                 s.getStatus(), s.getAgentState(), s.getProbeCount(), s.getQuestionCount(),
-                s.getCreatedAt(), s.getUpdatedAt());
+                s.getResumeFileId(), s.getCreatedAt(), s.getUpdatedAt());
     }
 }

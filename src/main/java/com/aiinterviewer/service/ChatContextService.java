@@ -54,19 +54,21 @@ public class ChatContextService {
         if (InterviewSession.STATUS_FINISHED.equals(session.getStatus())) {
             throw new BusinessException(ErrorCode.BAD_REQUEST, "会话已结束，不能再发言");
         }
-        return persistMessage(sessionId, InterviewMessage.ROLE_USER, content, content.length());
+        return persistMessage(sessionId, InterviewMessage.ROLE_USER, content, content.length(), null);
     }
 
-    /** 阶段 2 Agent 写入 ASSISTANT 消息的入口（tokenCount 取 LLM 响应 usage） */
-    public MessageResponse writeAssistant(long sessionId, String content, int tokenCount) {
-        return persistMessage(sessionId, InterviewMessage.ROLE_ASSISTANT, content, tokenCount);
+    /** 阶段 2 Agent 写入 ASSISTANT 消息的入口（tokenCount 取 LLM 响应 usage；citations 为 RAG 引用，可空） */
+    public MessageResponse writeAssistant(long sessionId, String content, int tokenCount,
+                                          List<com.aiinterviewer.dto.Citation> citations) {
+        return persistMessage(sessionId, InterviewMessage.ROLE_ASSISTANT, content, tokenCount, citations);
     }
 
     /**
      * 落库 + 刷新会话活跃时间（同一事务），随后尽力写缓存。
      * seq 取 max+1，并发竞争由 uk_session_seq 唯一键兜底。
      */
-    private MessageResponse persistMessage(long sessionId, String role, String content, int tokenCount) {
+    private MessageResponse persistMessage(long sessionId, String role, String content, int tokenCount,
+                                           List<com.aiinterviewer.dto.Citation> citations) {
         InterviewMessage message = transactionTemplate.execute(status -> {
             long nextSeq = messageMapper.selectMaxSeq(sessionId) + 1;
             InterviewMessage m = new InterviewMessage();
@@ -75,6 +77,14 @@ public class ChatContextService {
             m.setRole(role);
             m.setContent(content);
             m.setTokenCount(tokenCount);
+            if (citations != null && !citations.isEmpty()) {
+                try {
+                    m.setCitations(objectMapper.writeValueAsString(citations));
+                } catch (JsonProcessingException e) {
+                    // 引用属增强信息，序列化失败不阻断消息落库
+                    log.warn("引用序列化失败，忽略 [sessionId={}]", sessionId, e);
+                }
+            }
             messageMapper.insert(m);
 
             // 状态推进 CREATED -> IN_PROGRESS，同时刷新 updated_at（列表按最近活跃排序）
@@ -210,7 +220,16 @@ public class ChatContextService {
     }
 
     private MessageResponse toResponse(InterviewMessage m) {
+        List<com.aiinterviewer.dto.Citation> citations = null;
+        if (m.getCitations() != null && !m.getCitations().isBlank()) {
+            try {
+                citations = objectMapper.readValue(m.getCitations(), objectMapper.getTypeFactory()
+                        .constructCollectionType(List.class, com.aiinterviewer.dto.Citation.class));
+            } catch (JsonProcessingException e) {
+                log.warn("引用反序列化失败，忽略 [seq={}]", m.getSeq(), e);
+            }
+        }
         return new MessageResponse(m.getSeq(), m.getRole(), m.getContent(),
-                m.getTokenCount(), m.getCreatedAt());
+                m.getTokenCount(), m.getCreatedAt(), citations);
     }
 }

@@ -29,6 +29,18 @@ public class AsyncConfig {
         return executor;
     }
 
+    /** 文档索引专用：单线程串行化，规避 SimpleVectorStore 并发写与落盘竞争 */
+    @Bean("ragIndexExecutor")
+    public ThreadPoolTaskExecutor ragIndexExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(1);
+        executor.setMaxPoolSize(1);
+        executor.setQueueCapacity(100);
+        executor.setThreadNamePrefix("rag-index-");
+        executor.initialize();
+        return executor;
+    }
+
     @Bean(destroyMethod = "shutdown")
     public ScheduledExecutorService sseHeartbeatScheduler() {
         return Executors.newSingleThreadScheduledExecutor(r -> {

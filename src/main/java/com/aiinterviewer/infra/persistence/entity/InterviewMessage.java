@@ -35,6 +35,9 @@ public class InterviewMessage {
     /** token 估算值；阶段 2 起以 LLM 响应 usage 为准 */
     private Integer tokenCount;
 
+    /** 引用资料 JSON（阶段 4 RAG 溯源），ASSISTANT 消息可有 */
+    private String citations;
+
     @TableField(fill = FieldFill.INSERT)
     private LocalDateTime createdAt;
 }

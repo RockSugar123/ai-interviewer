@@ -3,7 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'v
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ChatDotRound, Delete, Plus, Search, SwitchButton, Top } from '@element-plus/icons-vue'
-import { messageApi, sessionApi } from '../api'
+import { messageApi, resumeApi, sessionApi } from '../api'
 
 const router = useRouter()
 const username = localStorage.getItem('username') || '我'
@@ -69,19 +69,72 @@ const createVisible = ref(false)
 const creating = ref(false)
 const createForm = reactive({ title: '', jdText: '' })
 
+/* 简历（阶段4 RAG）：上传 → 轮询解析状态 → 挂载到新会话 */
+const resumes = ref([])
+const selectedResumeId = ref(null)
+const uploading = ref(false)
+
+function resumeSuffix(r) {
+  if (r.parseStatus === 'PENDING' || r.parseStatus === 'RUNNING') return '（解析中…）'
+  if (r.parseStatus === 'FAILED') return '（解析失败）'
+  return ''
+}
+
+async function loadResumes() {
+  try {
+    resumes.value = await resumeApi.list()
+    const done = resumes.value.filter((r) => r.parseStatus === 'DONE')
+    if (!selectedResumeId.value && done.length) selectedResumeId.value = done[0].id
+  } catch {
+    /* 简历非核心链路，静默 */
+  }
+}
+
+async function uploadResume({ file }) {
+  uploading.value = true
+  try {
+    const r = await resumeApi.upload(file)
+    selectedResumeId.value = r.id
+    ElMessage.info('简历上传成功，解析中…')
+    // 轮询解析状态（DONE/FAILED 结束）
+    for (let i = 0; i < 20; i++) {
+      await new Promise((s) => setTimeout(s, 2000))
+      await loadResumes()
+      const cur = resumes.value.find((x) => x.id === r.id)
+      if (!cur || (cur.parseStatus !== 'PENDING' && cur.parseStatus !== 'RUNNING')) {
+        if (cur && cur.parseStatus === 'FAILED') ElMessage.error('简历解析失败：' + (cur.errorMsg || '未知原因'))
+        else ElMessage.success('简历解析完成，出题将围绕简历展开')
+        break
+      }
+    }
+  } catch (e) {
+    ElMessage.error(e.message)
+  } finally {
+    uploading.value = false
+  }
+}
+
+function openCreate() {
+  createVisible.value = true
+  loadResumes()
+}
+
 async function createSession() {
   creating.value = true
   try {
     const detail = await sessionApi.create({
       title: createForm.title.trim() || undefined,
-      jdText: createForm.jdText.trim() || undefined
+      jdText: createForm.jdText.trim() || undefined,
+      resumeFileId: selectedResumeId.value || undefined
     })
     createVisible.value = false
     createForm.title = ''
     createForm.jdText = ''
     await loadSessions()
     await selectSession(detail.id)
-    ElMessage.success('会话已创建，发一段自我介绍开始面试')
+    ElMessage.success(selectedResumeId.value
+      ? '会话已创建（已挂简历），发一段自我介绍开始面试'
+      : '会话已创建，发一段自我介绍开始面试')
   } catch (e) {
     ElMessage.error(e.message)
   } finally {
@@ -328,7 +381,7 @@ onMounted(loadSessions)
         <span class="brand-name">AI 模拟面试官</span>
       </div>
 
-      <el-button type="primary" class="new-btn" @click="createVisible = true">
+      <el-button type="primary" class="new-btn" @click="openCreate">
         <el-icon style="margin-right: 6px"><Plus /></el-icon>新建面试
       </el-button>
 
@@ -377,6 +430,9 @@ onMounted(loadSessions)
             </template>
             <div class="jd-pop">{{ activeSession.jdText }}</div>
           </el-popover>
+          <el-tooltip v-if="activeSession.resumeFileId" content="本场面试已挂载简历，出题与追问将围绕简历展开" placement="bottom">
+            <span class="resume-chip">简历</span>
+          </el-tooltip>
           <el-tag size="small" :type="finished ? 'info' : 'primary'" effect="plain" round>
             {{ STATE_LABEL[activeSession.agentState] || '进行中' }}
           </el-tag>
@@ -389,7 +445,20 @@ onMounted(loadSessions)
           <div class="msg-col">
             <div v-for="m in messages" :key="m.seq" class="msg" :class="m.role === 'USER' ? 'me' : 'ai'">
               <div v-if="m.role !== 'USER'" class="ai-avatar">面</div>
-              <div class="bubble">{{ m.content }}</div>
+              <div class="msg-main">
+                <div class="bubble">{{ m.content }}</div>
+                <div v-if="m.role !== 'USER' && m.citations && m.citations.length" class="cite-row">
+                  <el-tooltip
+                    v-for="c in m.citations"
+                    :key="c.label"
+                    :content="`[${c.label}] ${c.source}：${c.snippet}`"
+                    placement="top"
+                    :hide-after="0"
+                  >
+                    <span class="cite-chip">{{ c.label }} {{ c.source }}</span>
+                  </el-tooltip>
+                </div>
+              </div>
             </div>
 
             <div v-if="thinking && !streaming" class="msg ai">
@@ -428,7 +497,7 @@ onMounted(loadSessions)
       <div v-else class="empty">
         <el-icon :size="56"><ChatDotRound /></el-icon>
         <p>选择左侧会话，或新建一场面试</p>
-        <el-button type="primary" round @click="createVisible = true">新建面试</el-button>
+        <el-button type="primary" round @click="openCreate">新建面试</el-button>
       </div>
     </main>
   </div>
@@ -448,6 +517,27 @@ onMounted(loadSessions)
           show-word-limit
           placeholder="粘贴职位描述…"
         />
+      </el-form-item>
+      <el-form-item label="简历（可选，面试官将围绕简历深挖；支持 PDF/DOC/DOCX，≤10MB）">
+        <div class="resume-box">
+          <el-upload :show-file-list="false" accept=".pdf,.doc,.docx" :http-request="uploadResume">
+            <el-button :loading="uploading">上传简历</el-button>
+          </el-upload>
+          <el-select
+            v-model="selectedResumeId"
+            placeholder="选择已上传的简历"
+            clearable
+            class="resume-select"
+          >
+            <el-option
+              v-for="r in resumes"
+              :key="r.id"
+              :value="r.id"
+              :label="r.fileName + resumeSuffix(r)"
+              :disabled="r.parseStatus !== 'DONE'"
+            />
+          </el-select>
+        </div>
       </el-form-item>
     </el-form>
     <template #footer>
@@ -617,6 +707,39 @@ onMounted(loadSessions)
 }
 
 .jd-chip:hover { color: var(--text-1); border-color: var(--text-2); }
+
+.resume-chip {
+  font-size: 12px;
+  color: #6ee7b7;
+  border: 1px solid rgba(110, 231, 183, 0.4);
+  border-radius: 6px;
+  padding: 1px 8px;
+  cursor: default;
+}
+
+.msg-main { min-width: 0; max-width: 660px; }
+
+.cite-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.cite-chip {
+  font-size: 11px;
+  color: var(--text-2);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 1px 6px;
+  cursor: default;
+}
+
+.cite-chip:hover { color: var(--text-1); border-color: var(--text-2); }
+
+.resume-box { display: flex; gap: 10px; width: 100%; }
+
+.resume-select { flex: 1; }
 
 .finish-btn { margin-left: auto; }
 
