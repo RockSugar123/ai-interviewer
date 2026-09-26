@@ -126,6 +126,10 @@ java -jar target/ai-interviewer-0.1.0-SNAPSHOT.jar
 
 登录 → 会话列表（历史数据正常）→ 会话 5 全量消息渲染、自动滚动到底部 → 新建面试弹窗 → 结束态输入禁用，全部通过 Playwright 截图自查。
 
+### 过程中发现并已修复的问题
+
+1. **前端更新后浏览器仍显示旧界面**（用户反馈）：index.html 无缓存头，被浏览器启发式缓存。已加 `IndexCacheFilter` 对入口页返回 `Cache-Control: no-store`，hash 资源名文件不受影响（PR #3）。
+
 **已知取舍**：Element Plus 全量引入，JS bundle ~1MB（gzip ~350KB），本地工具无碍；已做 element-plus/vue 手动分包；按需引入留待后续优化。
 
 ---
