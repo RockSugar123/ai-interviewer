@@ -436,9 +436,11 @@ onMounted(loadSessions)
           @click="selectSession(s.id)"
         >
           <div class="s-main">
-            <div class="s-title">{{ s.title || '未命名面试' }}</div>
+            <div class="s-title-row">
+              <span class="s-title">{{ s.title || '未命名面试' }}</span>
+              <span class="s-time">{{ formatTime(s.updatedAt) }}</span>
+            </div>
             <div class="s-sub">
-              <span>{{ formatTime(s.updatedAt) }}</span>
               <span class="s-state" :class="s.status === 'FINISHED' ? 'done' : 'ongoing'">
                 {{ s.status === 'FINISHED' ? '已结束' : STATE_LABEL[s.agentState] || '进行中' }}
               </span>
@@ -473,7 +475,7 @@ onMounted(loadSessions)
           <el-tag size="small" :type="finished ? 'info' : 'primary'" effect="plain" round>
             {{ STATE_LABEL[activeSession.agentState] || '进行中' }}
           </el-tag>
-          <el-button v-if="!finished" class="finish-btn" size="small" round plain type="danger" @click="finishInterview">
+          <el-button v-if="!finished" class="finish-btn" size="small" round plain @click="finishInterview">
             结束面试
           </el-button>
         </header>
@@ -625,7 +627,8 @@ onMounted(loadSessions)
   width: 28px;
   height: 28px;
   border-radius: 8px;
-  background: linear-gradient(135deg, #4d6bfe, #7c3aed);
+  background: #101013;
+  border: 1px solid var(--border);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -637,7 +640,22 @@ onMounted(loadSessions)
 
 .brand-name { font-weight: 600; font-size: 15px; }
 
-.new-btn { width: 100%; border-radius: 9px; height: 38px; }
+.new-btn {
+  width: 100%;
+  height: 38px;
+  border-radius: 9px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  color: var(--text-1);
+  font-weight: 400;
+}
+
+.new-btn:hover,
+.new-btn:focus {
+  background: var(--bg-hover);
+  border-color: var(--text-2);
+  color: var(--text-1);
+}
 
 .search { margin: 10px 0 4px; }
 
@@ -664,11 +682,26 @@ onMounted(loadSessions)
 
 .s-main { flex: 1; min-width: 0; }
 
+.s-title-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
 .s-title {
+  flex: 1;
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   font-size: 13.5px;
+}
+
+.s-time {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--text-2);
 }
 
 .s-sub {
@@ -679,7 +712,7 @@ onMounted(loadSessions)
   margin-top: 3px;
 }
 
-.s-state.ongoing { color: #6ee7b7; }
+.s-state.ongoing { color: var(--text-1); }
 .s-state.done { color: var(--text-2); }
 
 .s-del {
@@ -712,7 +745,8 @@ onMounted(loadSessions)
   width: 30px;
   height: 30px;
   border-radius: 50%;
-  background: linear-gradient(135deg, #4d6bfe, #7c3aed);
+  background: #101013;
+  border: 1px solid var(--border);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -759,8 +793,8 @@ onMounted(loadSessions)
 
 .resume-chip {
   font-size: 12px;
-  color: #6ee7b7;
-  border: 1px solid rgba(110, 231, 183, 0.4);
+  color: var(--text-2);
+  border: 1px solid var(--border);
   border-radius: 6px;
   padding: 1px 8px;
   cursor: default;
@@ -848,7 +882,8 @@ onMounted(loadSessions)
   width: 30px;
   height: 30px;
   border-radius: 9px;
-  background: linear-gradient(135deg, #4d6bfe, #7c3aed);
+  background: #101013;
+  border: 1px solid var(--border);
   display: flex;
   align-items: center;
   justify-content: center;

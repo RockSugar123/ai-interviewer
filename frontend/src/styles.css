@@ -7,18 +7,18 @@
   --border: #2e2e33;
   --text-1: #e8e8ec;
   --text-2: #9b9ba4;
-  --accent: #4d6bfe;
+  --accent: #e8e8ec;
 }
 
-/* 覆盖 Element Plus 主色，贴近 ZCode 蓝 */
+/* 覆盖 Element Plus 主色：黑白配色 */
 html.dark {
-  --el-color-primary: #4d6bfe;
-  --el-color-primary-light-3: #6d85ff;
-  --el-color-primary-light-5: #8fa2ff;
-  --el-color-primary-light-7: #b1bdff;
-  --el-color-primary-light-8: #c8d0ff;
-  --el-color-primary-light-9: #e3e7ff;
-  --el-color-primary-dark-2: #3e56cb;
+  --el-color-primary: #e8e8ec;
+  --el-color-primary-light-3: #d5d5db;
+  --el-color-primary-light-5: #b8b8c0;
+  --el-color-primary-light-7: #8a8a92;
+  --el-color-primary-light-8: #5a5a62;
+  --el-color-primary-light-9: #35353b;
+  --el-color-primary-dark-2: #c5c5cc;
   --el-bg-color: #232327;
   --el-bg-color-overlay: #26262b;
   --el-border-color: #2e2e33;
@@ -28,6 +28,13 @@ html.dark {
   --el-fill-color-light: #2a2a2f;
   --el-text-color-primary: #e8e8ec;
   --el-text-color-regular: #c9c9d1;
+}
+
+/* 主色改为近白后，primary 按钮文字转深色保证可读 */
+.el-button--primary {
+  --el-button-text-color: #17171a;
+  --el-button-hover-text-color: #000;
+  --el-button-active-text-color: #000;
 }
 
 * { box-sizing: border-box; }

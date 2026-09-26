@@ -95,7 +95,7 @@ async function submit() {
   align-items: center;
   justify-content: center;
   background:
-    radial-gradient(600px 320px at 50% 18%, rgba(77, 107, 254, 0.14), transparent 70%),
+    radial-gradient(600px 320px at 50% 18%, rgba(255, 255, 255, 0.04), transparent 70%),
     var(--bg-app);
 }
 
@@ -114,7 +114,8 @@ async function submit() {
   height: 52px;
   margin: 0 auto 14px;
   border-radius: 14px;
-  background: linear-gradient(135deg, #4d6bfe, #7c3aed);
+  background: #101013;
+  border: 1px solid var(--border);
   display: flex;
   align-items: center;
   justify-content: center;
