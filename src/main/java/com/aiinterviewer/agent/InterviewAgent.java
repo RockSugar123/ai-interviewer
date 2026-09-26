@@ -9,13 +9,16 @@ import com.aiinterviewer.infra.persistence.mapper.InterviewSessionMapper;
 import com.aiinterviewer.rag.RagProperties;
 import com.aiinterviewer.rag.RagRetrievalService;
 import com.aiinterviewer.rag.RetrievedChunk;
+import com.aiinterviewer.service.AnswerScoreService;
 import com.aiinterviewer.service.ChatContextService;
+import com.aiinterviewer.service.InterviewFinishedEvent;
 import com.aiinterviewer.service.SessionService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.ChatClientResponse;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.openai.OpenAiChatOptions;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
@@ -45,24 +48,34 @@ public class InterviewAgent {
             AgentAction.NEXT_QUESTION, AgentPrompts.INSTR_RESUME, InterviewPhase.QUESTIONING, 0, 0, false);
 
     private final ChatClient chatClient;
+    /** FR-17 降级链备用模型客户端（同 key 同端点，model 经 options 覆盖为 fallbackModel） */
+    private final ChatClient fallbackChatClient;
     private final SessionService sessionService;
     private final ChatContextService chatContextService;
     private final InterviewSessionMapper sessionMapper;
     private final RagRetrievalService ragRetrievalService;
     private final RagProperties ragProps;
     private final InterviewAgentProperties props;
+    private final AnswerScoreService answerScoreService;
+    private final ApplicationEventPublisher eventPublisher;
+    private final LlmResilience llmResilience;
 
     public InterviewAgent(ChatClient.Builder chatClientBuilder, SessionService sessionService,
                           ChatContextService chatContextService, InterviewSessionMapper sessionMapper,
                           RagRetrievalService ragRetrievalService, RagProperties ragProps,
-                          InterviewAgentProperties props) {
+                          InterviewAgentProperties props, AnswerScoreService answerScoreService,
+                          ApplicationEventPublisher eventPublisher, LlmResilience llmResilience) {
         this.chatClient = chatClientBuilder.build();
+        this.fallbackChatClient = chatClientBuilder.build();
         this.sessionService = sessionService;
         this.chatContextService = chatContextService;
         this.sessionMapper = sessionMapper;
         this.ragRetrievalService = ragRetrievalService;
         this.ragProps = ragProps;
         this.props = props;
+        this.answerScoreService = answerScoreService;
+        this.eventPublisher = eventPublisher;
+        this.llmResilience = llmResilience;
     }
 
     /** 生成面试官回复（同步整段版，stream-enabled=false 时保留）。调用前用户消息必须已入库。
@@ -73,7 +86,7 @@ public class InterviewAgent {
         String jdText = session.getJdText();
         String transcript = buildTranscript(sessionId, userId);
         InterviewTools tools = new InterviewTools(ragRetrievalService, ragProps,
-                userId, session.getResumeFileId());
+                userId, session.getResumeFileId(), answerScoreService);
 
         if (phase == null) {
             log.info("[Agent] 开场 session={}", sessionId);
@@ -102,7 +115,7 @@ public class InterviewAgent {
         String jdText = session.getJdText();
         String transcript = buildTranscript(sessionId, userId);
         InterviewTools tools = new InterviewTools(ragRetrievalService, ragProps,
-                userId, session.getResumeFileId());
+                userId, session.getResumeFileId(), answerScoreService);
 
         PlannedAction plan;
         String decisionTopic = null;
@@ -121,7 +134,7 @@ public class InterviewAgent {
         GenerateInput input = assembleInput(session.getResumeFileId(), jdText, transcript, plan, decisionTopic);
         MessageResponse reply = generateStreaming(sessionId, AgentPrompts.INTERVIEWER_SYSTEM,
                 input.promptText(), plan, tools, input.citations(), onDelta, onThink);
-        updatePhase(sessionId, plan.nextPhase(), plan.nextProbe(), plan.nextQuestion(), plan.finish());
+        updatePhase(sessionId, userId, plan.nextPhase(), plan.nextProbe(), plan.nextQuestion(), plan.finish());
         if (plan.finish()) {
             log.info("[Agent] 面试结束 session={}", sessionId);
         }
@@ -135,21 +148,43 @@ public class InterviewAgent {
                 nz(session.getProbeCount()), props.maxProbesPerQuestion(),
                 nz(session.getQuestionCount()), props.maxQuestions(), jdText, transcript);
         try {
-            AgentDecision decision = chatClient.prompt()
-                    .system(AgentPrompts.DECISION_SYSTEM)
-                    .user(input)
-                    .options(OpenAiChatOptions.builder().temperature(props.decisionTemperature()).build())
-                    .call()
-                    .entity(AgentDecision.class);
+            AgentDecision decision = llmResilience.withDecision(() ->
+                    chatClient.prompt()
+                            .system(AgentPrompts.DECISION_SYSTEM)
+                            .user(input)
+                            .options(OpenAiChatOptions.builder().temperature(props.decisionTemperature()).build())
+                            .call()
+                            .entity(AgentDecision.class));
             if (decision == null) {
                 throw new IllegalStateException("决策输出为空");
             }
             log.info("[Agent] 决策 session={} phase={} -> {} (topic={}, reason={})",
                     session.getId(), phase, decision.normalizedAction(), decision.topic(), decision.reason());
             return decision;
-        } catch (Exception e) {
-            log.error("[Agent] 决策调用失败，安全降级为 NEXT_QUESTION session={}", session.getId(), e);
-            return new AgentDecision(AgentAction.NEXT_QUESTION.name(), 1, null, "决策调用失败，安全默认");
+        } catch (Exception primary) {
+            // FR-17 降级链第二步：主模型（熔断/重试后）仍失败 → 切备用模型
+            log.warn("[Agent] 主模型决策失败，切换备用模型 [fallback={}]", props.fallbackModel(), primary);
+            try {
+                AgentDecision decision = llmResilience.withMain(() ->
+                        fallbackChatClient.prompt()
+                                .system(AgentPrompts.DECISION_SYSTEM)
+                                .user(input)
+                                .options(OpenAiChatOptions.builder()
+                                        .model(props.fallbackModel())
+                                        .temperature(props.decisionTemperature()).build())
+                                .call()
+                                .entity(AgentDecision.class));
+                if (decision == null) {
+                    throw new IllegalStateException("备用模型决策输出为空");
+                }
+                llmResilience.recordFallback();
+                log.info("[Agent] 备用模型决策成功 session={} -> {}", session.getId(), decision.normalizedAction());
+                return decision;
+            } catch (Exception fallback) {
+                // 降级链尽头：决策层安全默认（NEXT_QUESTION），主链路不中断
+                log.error("[Agent] 备用模型决策也失败，安全降级为 NEXT_QUESTION session={}", session.getId(), fallback);
+                return new AgentDecision(AgentAction.NEXT_QUESTION.name(), 1, null, "决策调用失败，安全默认");
+            }
         }
     }
 
@@ -200,7 +235,7 @@ public class InterviewAgent {
         GenerateInput input = assembleInput(resumeFileId, jdText, transcript, plan, decisionTopic);
         MessageResponse reply = generateAndPersist(sessionId, AgentPrompts.INTERVIEWER_SYSTEM,
                 input.promptText(), plan.action().name(), tools, input.citations());
-        updatePhase(sessionId, plan.nextPhase(), plan.nextProbe(), plan.nextQuestion(), plan.finish());
+        updatePhase(sessionId, userId, plan.nextPhase(), plan.nextProbe(), plan.nextQuestion(), plan.finish());
         if (plan.finish()) {
             log.info("[Agent] 面试结束 session={}", sessionId);
         }
@@ -249,13 +284,16 @@ public class InterviewAgent {
 
     private MessageResponse generateAndPersist(long sessionId, String system, String user, String tag,
                                                InterviewTools tools, List<Citation> citations) {
-        ChatClientResponse ccr = chatClient.prompt()
-                .system(system)
-                .user(user)
-                .options(OpenAiChatOptions.builder().temperature(props.generationTemperature()).build())
-                .tools(tools)
-                .call()
-                .chatClientResponse();
+        ChatClientResponse ccr;
+        try {
+            ccr = llmResilience.withMain(() ->
+                    callOnce(chatClient, null, system, user, tools));
+        } catch (Exception primary) {
+            // FR-17 降级链：主模型失败 → 备用模型（同步整段路径，无部分输出问题）
+            log.warn("[Agent] 主模型同步生成失败，切换备用模型 [fallback={}]", props.fallbackModel(), primary);
+            llmResilience.recordFallback();
+            ccr = callOnce(fallbackChatClient, props.fallbackModel(), system, user, tools);
+        }
         ChatResponse chatResponse = ccr.chatResponse();
         String text = chatResponse.getResult().getOutput().getText();
         int totalTokens = 0;
@@ -267,17 +305,62 @@ public class InterviewAgent {
         return chatContextService.writeAssistant(sessionId, text, totalTokens, citations);
     }
 
-    /** 流式生成：逐 token 回调（失败/超时抛异常，由上层 error 事件兜底），完成后落库并返回终稿 */
+    /** 同步整段调用一次（modelOverride 非空时覆盖模型，用于备用模型） */
+    private ChatClientResponse callOnce(ChatClient client, String modelOverride, String system,
+                                        String user, InterviewTools tools) {
+        OpenAiChatOptions.Builder opts = OpenAiChatOptions.builder().temperature(props.generationTemperature());
+        if (modelOverride != null) {
+            opts.model(modelOverride);
+        }
+        return client.prompt().system(system).user(user).options(opts.build())
+                .tools(tools).call().chatClientResponse();
+    }
+
+    /** 流式生成（FR-17 降级链）：主模型（熔断保护）失败且尚无输出 → 切备用模型重跑整段；
+     * 已推送过 delta 的不重试（前端已收到增量，重放会重复内容），直接抛给上层 error 事件兜底。 */
     private MessageResponse generateStreaming(long sessionId, String system, String user,
                                               PlannedAction plan, InterviewTools tools,
                                               List<Citation> citations, Consumer<String> onDelta,
                                               Consumer<String> onThink) {
         StringBuilder text = new StringBuilder();
         AtomicReference<Number> usageTokens = new AtomicReference<>();
-        chatClient.prompt()
+        try {
+            llmResilience.withMain(() -> {
+                streamOnce(chatClient, null, system, user, tools, text, usageTokens, onDelta, onThink);
+                return null;
+            });
+        } catch (Exception primary) {
+            if (!text.isEmpty()) {
+                throw primary;
+            }
+            log.warn("[Agent] 主模型流式生成失败，切换备用模型 [fallback={}]", props.fallbackModel(), primary);
+            llmResilience.recordFallback();
+            streamOnce(fallbackChatClient, props.fallbackModel(), system, user, tools, text, usageTokens, onDelta, onThink);
+        }
+        String content = text.toString();
+        if (content.isBlank()) {
+            throw new IllegalStateException("流式生成结果为空");
+        }
+        int totalTokens = usageTokens.get() != null
+                ? usageTokens.get().intValue()
+                : (int) Math.round(content.length() / 2.0); // 流式 usage 缺失时按中文密度粗估
+        log.info("[Agent] 流式生成完成 session={} tag={} tokens={} chars={}",
+                sessionId, plan.action(), totalTokens, content.length());
+        return chatContextService.writeAssistant(sessionId, content, totalTokens, citations);
+    }
+
+    /** 流式跑一段生成（modelOverride 非空时覆盖模型，用于备用模型） */
+    private void streamOnce(ChatClient client, String modelOverride, String system, String user,
+                            InterviewTools tools, StringBuilder text, AtomicReference<Number> usageTokens,
+                            Consumer<String> onDelta, Consumer<String> onThink) {
+        OpenAiChatOptions.Builder opts = OpenAiChatOptions.builder().temperature(props.generationTemperature());
+        if (modelOverride != null) {
+            opts.model(modelOverride);
+        }
+        client.prompt()
                 .system(system)
                 .user(user)
-                .options(OpenAiChatOptions.builder().temperature(props.generationTemperature()).build())
+                .options(opts.build())
                 .tools(tools)
                 .stream()
                 .chatClientResponse()
@@ -295,16 +378,6 @@ public class InterviewAgent {
                 })
                 .timeout(Duration.ofSeconds(props.generationTimeoutSeconds()))
                 .blockLast();
-        String content = text.toString();
-        if (content.isBlank()) {
-            throw new IllegalStateException("流式生成结果为空");
-        }
-        int totalTokens = usageTokens.get() != null
-                ? usageTokens.get().intValue()
-                : (int) Math.round(content.length() / 2.0); // 流式 usage 缺失时按中文密度粗估
-        log.info("[Agent] 流式生成完成 session={} tag={} tokens={} chars={}",
-                sessionId, plan.action(), totalTokens, content.length());
-        return chatContextService.writeAssistant(sessionId, content, totalTokens, citations);
     }
 
     /** 流式各分片可能缺 usage；取首个非空 totalTokens（通常在最后一个分片） */
@@ -341,7 +414,7 @@ public class InterviewAgent {
 
     // ---------- 状态与上下文 ----------
 
-    private void updatePhase(long sessionId, InterviewPhase phase, int probeCount, int questionCount, boolean finish) {
+    private void updatePhase(long sessionId, long userId, InterviewPhase phase, int probeCount, int questionCount, boolean finish) {
         InterviewSession update = new InterviewSession();
         update.setId(sessionId);
         update.setAgentState(phase.name());
@@ -349,6 +422,8 @@ public class InterviewAgent {
         update.setQuestionCount(questionCount);
         if (finish) {
             update.setStatus(InterviewSession.STATUS_FINISHED);
+            // 语义收尾（WRAP_UP）与 finish 接口同走结束事件 → 报告链路；Agent 无事务，监听端 fallbackExecution 立即发 MQ
+            eventPublisher.publishEvent(new InterviewFinishedEvent(sessionId, userId, System.currentTimeMillis()));
         }
         sessionMapper.updateById(update);
     }

@@ -16,11 +16,9 @@
 | 2.6 前端重构 | ✅ 完成 | 2026-09-26 | Vue3+Vite+Element Plus 重构为 ZCode 风格暗色 UI；登录→会话→聊天→结束全流程截图自查通过 |
 | 3 SSE 流式 | ✅ 完成 | 2026-09-26 | 浏览器两轮流式闭环；重连三路径（内容中/思考中/已完成）实测不丢不重；409 守卫、心跳、首 token 埋点通过 |
 | 4 RAG 管线 | ✅ 完成 | 2026-09-26 | 简历上传→解析 6 块→真题库 150 题播种；模型按简历原文出题/追问并带 [S1] 引用；rerank 生效；无简历会话隔离回归通过 |
-| 3 SSE 流式 | ⬜ 未开始 | — | — |
-| 4 RAG 管线 | ⬜ 未开始 | — | — |
-| 5 MQ 异步报告 | ⬜ 未开始 | — | — |
-| 6 稳定性 | ⬜ 未开始 | — | — |
-| 7 压测 | ⬜ 未开始 | — | — |
+| 5 MQ 异步报告 | ✅ 完成 | 2026-09-26 | finish→MQ→LLM 四维报告→落库→查询闭环；Redis 宕机 4 次退避重试自愈（FR-15）；索引迁 MQ、scoreAnswer 真评分 |
+| 6 稳定性 | ✅ 完成 | 2026-09-26 | burst 6 条第 6 条 429（FR-16）；主模型故障切 qwen-flash 面试继续（FR-17）；Grafana 4 面板有数 |
+| 7 压测 | ❌ 已砍 | 2026-09-26 | 非面向高并发场景；性能指标由阶段 6 可观测性覆盖，W7 作缓冲 |
 | 8 交付 | ⬜ 未开始 | — | — |
 
 ---
@@ -253,9 +251,65 @@ java -jar target/ai-interviewer-0.1.0-SNAPSHOT.jar
 
 ---
 
-## 10. 下一步：阶段 5（MQ 异步报告，W5）
+## 10. 已完成：阶段 5（MQ 异步报告，W5）
 
-1. RocketMQ（VM compose 或本机）：面试结束发消息 → 消费者聚合会话 → LLM 生成四维报告 → 落库
-2. **FR-15 三个都真实现**：幂等（uk_session + Redis setnx）、重试（退避 N 次）、死信（DLQ + 补偿查询）
-3. 文档索引任务迁入 MQ（阶段 4 的 @Async 迁移，正好是一次真实改造）
-4. scoreAnswer 真评分启用，报告链路接入；前端报告页
+### 部署形态（VM 搁置）
+
+- RocketMQ **5.3.4 本机 Windows 原生**（zip 解压 `F:\rocketmq\`，JDK 17 官方脚本已兼容无需改）；启动固化 `scripts/start-rocketmq.bat`（幂等，端口占用跳过）；broker 配置 `scripts/rocketmq/broker-dev.conf`；**使用文档 `F:\rocketmq\使用文档.md`**；`.env` 加 `ROCKETMQ_NAME_SERVER`
+- 踩坑沉淀：properties 里 `F:\rocketmq` 的 `\r` 被转义吃掉（路径必须正斜杠）；bat 按 GBK 解析（纯 ASCII）；Git Bash 劫持 timeout（ping 替代）；rocketmq-spring 2.3.1 注解无 consumeThreadMin（单设 max 会因 min(20)>max 启动失败，改用方法级 synchronized 串行）
+
+### 交付内容
+
+- **V4 迁移**：`interview_report.error_msg`（FAILED 原因可见）
+- **事件驱动触发**：会话结束统一发 `InterviewFinishedEvent`（finish 接口事务内 / Agent WRAP_UP 无事务两个来源）→ `@TransactionalEventListener(AFTER_COMMIT, fallbackExecution)` → RocketMQ syncSend（KEYS = sessionId:finishedAt）
+- **消费者 report-consumer-group**：Redis setnx(sessionId+finishedAt, 30min) 幂等 + `uk_session` 兜底 → 聚合会话全量消息（30000 字符保尾部）→ LLM 四维 Markdown 报告（低温 0.3）→ 状态机 PENDING→RUNNING→DONE/FAILED
+- **FR-15 三件套**：幂等（双层如上）；重试（失败释放幂等锁并抛异常 → RocketMQ 指数退避重试）；死信（耗尽进 `%DLQ%report-consumer-group`）+ 补偿接口 `POST /api/sessions/{id}/report/retry`（新 finishedAt 重新入队，覆盖更新旧报告）
+- **文档索引迁 MQ**（阶段 4 的 @Async 迁移）：ResumeIndexListener 串行消费（synchronized 保 SimpleVectorStore 写安全）；确定性失败（解析为空）ACK 不重试 / 瞬时失败抛出走退避重试；`interview.mq.enabled=false` 时同步降级
+- **scoreAnswer 真评分**（FR-5/FR-6 兑现）：AnswerScoreService 单次低温结构化三维评分（depth/structure/correctness + brief/missed），失败返回 unavailable（工具永不抛异常）
+- **API**：`GET /api/sessions/{id}/report`（前端轮询）、retry；**前端**：会话头部"查看报告"（FINISHED 时）+ ReportView（轻量 Markdown 渲染零依赖 + 3s 轮询 + 失败重试按钮）
+
+### 验证记录（2026-09-26）
+
+| # | 用例 | 结果 |
+|---|---|---|
+| 1 | finish → MQ → 消费 → 报告 DONE（3283 tokens，四维带 Score 评分） | ✅ |
+| 2 | Redis 宕机 → 4 次退避重试（10s/30s/60s/2m）→ Redis 恢复自愈成功（FR-15 重试实测） | ✅ |
+| 3 | retry 补偿：PENDING → 重新生成 → DONE 覆盖（技术深度 5→4 分证明真重新生成） | ✅ |
+| 4 | 简历上传 → MQ → 串行消费 → 6 块索引 DONE（25s） | ✅ |
+| 5 | scoreAnswer 被模型自主调用（日志 questionLen=35 answerLen=50） | ✅ |
+| 6 | 报告页随 jar 托管，bundle 含 ReportView | ✅ |
+
+---
+
+## 11. 已完成：阶段 6（稳定性与成本，W6）
+
+### 交付内容
+
+- **FR-16 限流**：`LlmRateLimiter`——用户级发言 Lua 令牌桶（capacity 5 / 0.5 条每秒，原子扣减）+ 全局 token 日配额（Redis 按日 INCRBY，发言前检查 + usage 回来后记账）；挂载在发言接口（LLM 调用唯一用户入口）；限流器自身 Redis 异常**降级放行**（保护措施不反杀主链路）；拒绝计数指标 interview.ratelimit.rejected
+- **FR-17 韧性**：`LlmResilience` 编程式 CB（失败率 50%/窗口 10/30s 半开）+ Retry（决策 2 次指数退避）+ **降级链 = 主模型 → 备用模型 qwen-flash（.env 可配）→ 兜底**（决策安全降级 NEXT_QUESTION / 生成 error 事件）；流式部分输出后不重试（防内容重复）；CB 打开后主模型快速失败立即切备用
+- **FR-18 成本报表**：`GET /api/usage` 按会话聚合 token（interview_message 消息 + interview_report 报告）
+- **可观测**：Prometheus 3.1.0 + Grafana 11.4.0 Windows 本机（`F:\monitoring`），抓取 `:8080/actuator/prometheus`；仪表盘 4 面板（首 token P95/熔断与 fallback/限流拒绝与生成错误/token 消耗）provisioning 自动加载
+
+### 验证记录（2026-09-26）
+
+| # | 用例 | 结果 |
+|---|---|---|
+| 1 | burst 6 条发言 → 第 6 条 42900（令牌桶 5 发尽；#2-5 为 409 in-flight 但令牌已扣） | ✅ |
+| 2 | Prometheus 抓取 `interview_ratelimit_rejected_total` 有数 | ✅ |
+| 3 | 模拟主模型故障（LLM_MODEL 临时改错名）→ 决策切 qwen-flash 成功（PROBE）→ 流式生成切备用成功 → 面试继续服务；恢复配置重启回归 | ✅ |
+| 4 | Grafana datasources + dashboard 自动加载（4 面板） | ✅ |
+| 5 | usage 报表：会话 11 messageTokens=2829 + reportTokens=3846 | ✅ |
+
+### 已知问题 / 有意取舍
+
+- TimeLimiter 未引入：HTTP 客户端超时 + 流式分片间 180s 已覆盖时间维度
+- 生成侧不做 Retry（流式重放语义复杂），只 CB + 备用模型；决策/评分 token 不计入全局配额（占比小）
+- finish 与生成并发的 agentState 覆盖竞态为历史遗留（非本阶段引入），待观察
+
+---
+
+## 12. 下一步：阶段 8 交付
+
+1. README（架构图、选型 why-not 自检表）+ compose 一键部署整理
+2. 线上 demo：**唯一 Linux 硬需求**——云服务器采购与否待用户决策（替代方案：录屏 + 截图）
+3. 验收对照：需求文档 9 节 1-4 条

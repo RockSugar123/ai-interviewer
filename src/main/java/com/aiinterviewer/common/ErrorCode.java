@@ -10,6 +10,8 @@ public enum ErrorCode {
     FORBIDDEN(40300, "无权访问"),
     NOT_FOUND(40400, "资源不存在"),
     CONFLICT(40900, "资源冲突"),
+    TOO_MANY_REQUESTS(42900, "发言太频繁，请稍候再试"),
+    QUOTA_EXCEEDED(42901, "今日 token 配额已用尽，请明天再来"),
     INTERNAL(50000, "服务器内部错误");
 
     private final int code;

@@ -55,6 +55,13 @@ interview.agent:
   generation-temperature: 0.7
   stream-enabled: true         # W3 SSE 流式总开关，false 回退同步整段路径
   generation-timeout-seconds: 180
+  fallback-model: ${LLM_FALLBACK_MODEL:qwen-flash}   # FR-17：主模型失败后的备用模型
+
+interview.ratelimit:
+  enabled: true                # FR-16 总开关：false 时限流/配额全部放行
+  speak-capacity: 5            # 用户级令牌桶容量（突发可连发 5 条）
+  speak-refill-per-second: 0.5 # 令牌填充速率（平均 2 秒一条发言）
+  daily-token-quota: 2000000   # 全局每日 token 配额（所有用户共享，超出拒绝发言）
 
 interview.stream:
   emitter-timeout-ms: 300000   # SSE 连接最长保持时间（覆盖一次完整生成）
@@ -69,6 +76,17 @@ interview.rag:
   rerank-enabled: true         # gte-rerank-v2 重排（失败降级为向量序）
   rerank-base-url: ${DASHSCOPE_RERANK_BASE_URL:https://dashscope.aliyuncs.com}
   max-inject-chars: 2400       # 注入生成 prompt 的资料字符预算
+
+interview.mq:
+  enabled: true                # MQ 总开关：false 时报告链路停用、简历索引退回同步（阶段 4 行为）
+  report-topic: interview-report
+  index-topic: resume-index
+
+rocketmq:
+  name-server: ${ROCKETMQ_NAME_SERVER:127.0.0.1:9876}
+  producer:
+    group: ai-interviewer-producer
+    send-message-timeout: 5000
 
 jwt:
   secret: ${JWT_SECRET:}

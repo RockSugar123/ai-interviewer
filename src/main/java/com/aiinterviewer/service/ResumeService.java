@@ -10,6 +10,7 @@ import com.aiinterviewer.rag.RagProperties;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.rocketmq.spring.core.RocketMQTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -23,8 +24,8 @@ import java.util.Set;
 import java.util.UUID;
 
 /**
- * 简历文件（FR-10）：上传校验 → 落盘 → 记录 PENDING → 异步索引（RagIndexService）。
- * 上传即刻返回，前端轮询 parseStatus；失败原因见 errorMsg。
+ * 简历文件（FR-10）：上传校验 → 落盘 → 记录 PENDING → 投递 MQ 索引任务（阶段 5 起，ResumeIndexListener 串行消费；
+ * MQ 停用时同步降级）。上传即刻返回，前端轮询 parseStatus；失败原因见 errorMsg。
  */
 @Slf4j
 @Service
@@ -37,6 +38,8 @@ public class ResumeService {
     private final ResumeFileMapper resumeFileMapper;
     private final RagIndexService ragIndexService;
     private final RagProperties ragProperties;
+    private final MqProperties mqProperties;
+    private final RocketMQTemplate rocketMQTemplate;
 
     public ResumeFileResponse upload(long userId, MultipartFile file) {
         if (!ragProperties.enabled()) {
@@ -69,7 +72,14 @@ public class ResumeService {
         entity.setFileSize(file.getSize());
         entity.setParseStatus(ResumeFile.STATUS_PENDING);
         resumeFileMapper.insert(entity);
-        ragIndexService.indexResumeAsync(entity.getId());
+        if (mqProperties.enabled()) {
+            // 消息体用字符串 id（ResumeIndexListener 单线程串行消费，保证 SimpleVectorStore 写安全）
+            rocketMQTemplate.syncSend(mqProperties.indexTopic(), String.valueOf(entity.getId()));
+            log.info("简历索引任务已投递 MQ [id={}]", entity.getId());
+        } else {
+            // MQ 停用：同步降级（阶段 4 行为，上传耗时变长）
+            ragIndexService.indexResume(entity.getId());
+        }
         log.info("简历上传 [id={} userId={} file={} size={}]", entity.getId(), userId,
                 entity.getFileName(), entity.getFileSize());
         return toResponse(entity);

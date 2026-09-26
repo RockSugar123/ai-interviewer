@@ -3,6 +3,7 @@ package com.aiinterviewer.agent.tools;
 import com.aiinterviewer.rag.RagProperties;
 import com.aiinterviewer.rag.RagRetrievalService;
 import com.aiinterviewer.rag.RetrievedChunk;
+import com.aiinterviewer.service.AnswerScoreService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
@@ -11,7 +12,7 @@ import java.util.List;
 
 /**
  * 面试官工具（FR-5）。阶段 4 起：题库检索/简历要点提取接入 RAG 真实现（阶段 2 的 stub 契约兑现，
- * @Tool 描述与调用方语义不变）；回答评分仍为 stub，阶段 5 报告链路启用。
+ * @Tool 描述与调用方语义不变）；阶段 5 起：回答评分接入真实现（单次低温 LLM 结构化评分）。
  *
  * 不再是单例 Bean：每次生成按候选人实例化（工具需要 userId 做归属检索）。
  * 工具永不抛异常（失败兜底原则），异常就地降级为可读的失败返回值。
@@ -24,13 +25,15 @@ public class InterviewTools {
     /** 本轮生成对应的候选人（RAG 归属键）与其会话挂载的简历（会话级隔离） */
     private final long userId;
     private final Long resumeFileId;
+    private final AnswerScoreService answerScoreService;
 
     public InterviewTools(RagRetrievalService retrieval, RagProperties ragProps,
-                          long userId, Long resumeFileId) {
+                          long userId, Long resumeFileId, AnswerScoreService answerScoreService) {
         this.retrieval = retrieval;
         this.ragProps = ragProps;
         this.userId = userId;
         this.resumeFileId = resumeFileId;
+        this.answerScoreService = answerScoreService;
     }
 
     @Tool(description = "检索面试题库，返回针对指定主题与难度的候选面试题列表。" +
@@ -82,14 +85,14 @@ public class InterviewTools {
         }
     }
 
-    @Tool(description = "对候选人的回答进行结构化评分（技术深度、表达结构、正确性）。" +
-            "当前为 stub，返回未接入标记，收到此标记时应基于对话内容自行评估。")
+    @Tool(description = "对候选人的回答进行结构化评分：技术深度 depth、表达结构 structure、正确性 correctness（各 1-10 分），" +
+            "附一句话点评 brief 与关键遗漏 missed。用于判断回答质量、决定追问深度或切换话题。")
     public String scoreAnswer(
             @ToolParam(description = "向候选人提出的问题") String question,
             @ToolParam(description = "候选人的回答") String answer) {
-        log.info("[Tool] scoreAnswer questionLen={} answerLen={} (stub)",
+        log.info("[Tool] scoreAnswer questionLen={} answerLen={}",
                 nullSafeLen(question), nullSafeLen(answer));
-        return "{\"available\":false,\"note\":\"评分能力尚未接入，请基于对话内容自行判断回答质量\"}";
+        return answerScoreService.score(question, answer);
     }
 
     private int nullSafeLen(String s) {
