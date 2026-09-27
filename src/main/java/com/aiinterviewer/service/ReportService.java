@@ -5,6 +5,7 @@ import com.aiinterviewer.common.ErrorCode;
 import com.aiinterviewer.dto.MessageResponse;
 import com.aiinterviewer.dto.ReportResponse;
 import com.aiinterviewer.infra.persistence.entity.InterviewMessage;
+import com.aiinterviewer.infra.persistence.entity.InterviewNote;
 import com.aiinterviewer.infra.persistence.entity.InterviewReport;
 import com.aiinterviewer.infra.persistence.mapper.InterviewReportMapper;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
@@ -55,12 +56,14 @@ public class ReportService {
     private final StringRedisTemplate redis;
     private final ObjectMapper objectMapper;
     private final com.aiinterviewer.infra.limiter.LlmRateLimiter rateLimiter;
+    private final QuestionReviewService reviewService;
 
     public ReportService(ChatClient.Builder chatClientBuilder, RocketMQTemplate rocketMQTemplate,
                          MqProperties mqProps, InterviewReportMapper reportMapper,
                          SessionService sessionService, ChatContextService chatContextService,
                          StringRedisTemplate redis, ObjectMapper objectMapper,
-                         com.aiinterviewer.infra.limiter.LlmRateLimiter rateLimiter) {
+                         com.aiinterviewer.infra.limiter.LlmRateLimiter rateLimiter,
+                         QuestionReviewService reviewService) {
         this.chatClient = chatClientBuilder.build();
         this.rocketMQTemplate = rocketMQTemplate;
         this.mqProps = mqProps;
@@ -70,6 +73,7 @@ public class ReportService {
         this.redis = redis;
         this.objectMapper = objectMapper;
         this.rateLimiter = rateLimiter;
+        this.reviewService = reviewService;
     }
 
     // ---------- 生产侧：会话结束事件 → MQ ----------
@@ -77,6 +81,9 @@ public class ReportService {
     /** finish 接口有事务 → AFTER_COMMIT 后发；Agent 侧无事务 → fallbackExecution 立即发 */
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT, fallbackExecution = true)
     public void onInterviewFinished(InterviewFinishedEvent event) {
+        // 终题复盘兜底（阶段 7）：finish 接口显式结束时最后一题往往未到决策边界，在此补一次复盘；
+        // WRAP_UP 路径已复盘过的会重复触发，由"区间无候选人发言即跳过"的边界规则挡掉，不产生重复素材
+        reviewService.submitFinalReview(event.sessionId(), event.userId());
         if (!mqProps.enabled()) {
             log.info("[Report] MQ 未开启，跳过报告生成 [sessionId={}]", event.sessionId());
             return;
@@ -166,7 +173,7 @@ public class ReportService {
         InterviewReport done = new InterviewReport();
         done.setId(reportId);
         done.setStatus(InterviewReport.STATUS_DONE);
-        done.setContent(content);
+        done.setContent(content + reviewSection(sessionId));
         done.setModel(model);
         done.setTokenUsed(tokens);
         done.setErrorMsg("");
@@ -185,6 +192,47 @@ public class ReportService {
         }
         String s = sb.toString();
         return s.length() > MAX_TRANSCRIPT_CHARS ? s.substring(s.length() - MAX_TRANSCRIPT_CHARS) : s;
+    }
+
+    /**
+     * 逐题复盘章节（阶段 7）：汇总后台复盘 agent 落在 interview_note 的素材（题目/回答/评分/点评/参考答案），
+     * 纯代码拼装不再过 LLM。素材为空或全部是占位行时返回空串（报告维持四维结构，老会话不受影响）。
+     * 注意与报告 LLM 调用存在轻微竞态：终题复盘是异步任务，理论上可能晚于报告落库——
+     * 复盘任务秒级完成而报告 LLM 调用分钟级，实际几乎不会发生；真发生则该题缺章节，可 retry 重新生成。
+     */
+    private String reviewSection(long sessionId) {
+        List<InterviewNote> notes = reviewService.listNotes(sessionId);
+        StringBuilder sb = new StringBuilder();
+        int no = 0;
+        for (InterviewNote n : notes) {
+            if (n.getAnswerText() == null || n.getAnswerText().isBlank()) {
+                continue; // 边界占位行（如续场前历史），不是真实题目
+            }
+            no++;
+            sb.append("\n\n---\n\n### 第").append(no).append("题 ").append(nullSafe(n.getQuestionText()))
+                    .append("\n\n**你的回答：** ").append(n.getAnswerText().trim())
+                    .append("\n\n**得分：** 深度 ").append(n.getDepth())
+                    .append(" / 结构 ").append(n.getStructure())
+                    .append(" / 正确性 ").append(n.getCorrectness());
+            if (notBlank(n.getBrief())) {
+                sb.append("\n\n**点评：** ").append(n.getBrief());
+            }
+            if (notBlank(n.getMissed())) {
+                sb.append("\n\n**关键遗漏：** ").append(n.getMissed());
+            }
+            if (notBlank(n.getReferenceAnswer())) {
+                sb.append("\n\n**参考答案：** ").append(n.getReferenceAnswer());
+            }
+        }
+        return no == 0 ? "" : "\n\n---\n\n## 逐题复盘" + sb;
+    }
+
+    private static boolean notBlank(String s) {
+        return s != null && !s.isBlank();
+    }
+
+    private static String nullSafe(String s) {
+        return s == null ? "" : s;
     }
 
     // ---------- 报告记录状态机（uk_session 兜底幂等：并发插入冲突转 UPDATE） ----------

@@ -19,6 +19,7 @@
 | 5 MQ 异步报告 | ✅ 完成 | 2026-09-26 | finish→MQ→LLM 四维报告→落库→查询闭环；Redis 宕机 4 次退避重试自愈（FR-15）；索引迁 MQ、scoreAnswer 真评分 |
 | 6 稳定性 | ✅ 完成 | 2026-09-26 | burst 6 条第 6 条 429（FR-16）；主模型故障切 qwen-flash 面试继续（FR-17）；Grafana 4 面板有数 |
 | 7 压测 | ❌ 已砍 | 2026-09-26 | 非面向高并发场景；性能指标由阶段 6 可观测性覆盖，W7 作缓冲 |
+| 7R 后台复盘 agent | ✅ 代码完成 | 2026-09-27 | mvn 编译通过；启动验证通过（Flyway V5 自动建表 + 上下文装配 0 错误）；逐题复盘端到端待自测 |
 | 8 交付 | ⬜ 未开始 | — | — |
 
 ---
@@ -314,3 +315,32 @@ java -jar target/ai-interviewer-0.1.0-SNAPSHOT.jar
 - 阶段进度定格：0-6 全部完成；阶段 7 压测已砍；阶段 8 收尾取消
 - 自用启动清单：RocketMQ `scripts/start-rocketmq.bat` → Redis（F:\Redis 命令）→ 应用 `java -jar target/ai-interviewer-0.1.0-SNAPSHOT.jar` → 可选监控 `scripts/start-monitoring.bat`
 - 后续若要重启迭代（如 README、桌面端 FR-21），以本文档 + [实现方案.md](./实现方案.md) 为基准恢复上下文
+
+---
+
+## 13. 已完成：阶段 7R（后台复盘 agent，2026-09-27）
+
+项目重启迭代的第一步（用户需求确认单驱动）：**主对话不变，把耗时的 LLM 工作拆到后台并行**，并为每道题生成参考答案，面试结束后随报告给出「完整问题和答案」。
+
+### 改动
+
+- **评分后台化**：移除生成循环内的阻塞评分工具 `InterviewTools.scoreAnswer`（删除 `AnswerScoreService`）——候选人回答后主链路立即流式出回复，不再被评分 LLM 调用拖住
+- **后台复盘 agent**（`QuestionReviewService`）：题目边界（NEXT_QUESTION / SWITCH_TOPIC / WRAP_UP / finish 接口）触发，每题一次低温结构化调用产出 三维评分 + 点评 + 关键遗漏 + **参考答案**，落新表 `interview_note`（Flyway V5，`(session_id, seq_end)` 唯一键幂等）
+- **报告逐题复盘**：`ReportService` 生成报告后纯代码拼装「## 逐题复盘」章节追加（每题 = 问题 + 你的回答 + 得分 + 点评 + 参考答案），零前端改动；素材为空（老会话）自动省略章节
+- **上下文增强**：最近一题的复盘摘要注入后续生成的 prompt（`AgentPrompts.reviewBlock`），面试官出题/追问可参考上一题薄弱点
+- **独立线程池**：`AsyncConfig.reviewExecutor`（单线程 + 有界队列）——同会话复盘任务 FIFO 串行，WRAP_UP 与 finish 事件相邻提交时靠"上一条素材 seq_end 链式接力"自然去重；队列满直接丢弃并记日志（不反压主链路）
+
+### 设计要点与验证记录
+
+| # | 用例 | 结果 |
+|---|---|---|
+| 1 | `mvn -DskipTests package` 编译打包 | ✅ |
+| 2 | 启动验证：Flyway 自动应用 V5（`now at version v5`）+ Spring 上下文装配（新增 bean/线程池/依赖图无环），0 ERROR | ✅ |
+| 3 | 逐题复盘端到端（真实面试→报告含逐题章节） | ⬜ 待用户自测 |
+
+### 已知问题 / 有意取舍
+
+- 复盘素材与报告生成存在轻微竞态（终题复盘是异步任务，理论上可能晚于报告落库）——复盘秒级、报告 LLM 调用分钟级，实际几乎不发生；真发生则该题缺章节，retry 重新生成可解
+- 复盘 token 记入全局日配额（FR-16）但**不计入** FR-18 按会话成本报表（沿用"决策/评分 token 不入报表"的既有取舍）
+- 续场（阶段 4 功能）交互：本功能上线前的历史对话无法逐题切分，续场时落一条空素材占位行封住区间（报告汇总时跳过）；此后逐题复盘正常接力
+- **start.bat 注释与实际行为不符（历史遗留，非本阶段引入）**：MQ 未就绪时注释称"chat still works"，实际 `RocketMQMessageListenerContainerRegistrar` 注册失败会让应用启动中止（本次启动验证实测命中）；建议后续给两个 listener 加 `@ConditionalOnProperty(interview.mq.enabled)` 或容器失败降级，本期未动
