@@ -44,15 +44,40 @@ final class AgentPrompts {
                 trim(jdText, 800), transcript);
     }
 
-    static String generationInput(String instruction, String jdText, String transcript, String referenceBlock) {
+    static String generationInput(String instruction, String jdText, String transcript,
+                                  String referenceBlock, String reviewBlock) {
         String reference = referenceBlock == null || referenceBlock.isBlank()
                 ? ""
                 : referenceBlock + "\n";
+        String review = reviewBlock == null || reviewBlock.isBlank()
+                ? ""
+                : reviewBlock + "\n";
         return """
                 %s
                 目标 JD（节选）：%s
-                %s对话记录（时间正序，最后一条是候选人的最新发言）：
-                %s""".formatted(instruction, trim(jdText, 1500), reference, transcript);
+                %s%s对话记录（时间正序，最后一条是候选人的最新发言）：
+                %s""".formatted(instruction, trim(jdText, 1500), review, reference, transcript);
+    }
+
+    /** 最近复盘摘要块（阶段 7）：后台复盘 agent 对上一题的评分结论，供出题/追问参考薄弱点；无素材返回空串 */
+    static String reviewBlock(com.aiinterviewer.infra.persistence.entity.InterviewNote note) {
+        if (note == null) {
+            return "";
+        }
+        return "最近一题复盘摘要（可在出题或追问时参考候选人的薄弱点）：\n"
+                + "题目：" + note.getQuestionText() + "\n"
+                + "评分：深度 " + nz(note.getDepth()) + "，结构 " + nz(note.getStructure())
+                + "，正确性 " + nz(note.getCorrectness()) + "\n"
+                + "点评：" + nz(note.getBrief()) + "\n"
+                + "关键遗漏：" + nz(note.getMissed());
+    }
+
+    private static String nz(Integer v) {
+        return v == null ? "0" : String.valueOf(v);
+    }
+
+    private static String nz(String s) {
+        return s == null ? "" : s;
     }
 
     /** RAG 参考资料块（阶段 4）：注入生成 prompt，供出题/追问引用简历与题库内容 */

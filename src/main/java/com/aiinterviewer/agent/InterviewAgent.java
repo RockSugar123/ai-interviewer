@@ -9,9 +9,9 @@ import com.aiinterviewer.infra.persistence.mapper.InterviewSessionMapper;
 import com.aiinterviewer.rag.RagProperties;
 import com.aiinterviewer.rag.RagRetrievalService;
 import com.aiinterviewer.rag.RetrievedChunk;
-import com.aiinterviewer.service.AnswerScoreService;
 import com.aiinterviewer.service.ChatContextService;
 import com.aiinterviewer.service.InterviewFinishedEvent;
+import com.aiinterviewer.service.QuestionReviewService;
 import com.aiinterviewer.service.SessionService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
@@ -34,6 +34,8 @@ import java.util.function.Consumer;
  * 决策调用失败时安全降级为 NEXT_QUESTION，主链路不中断（失败兜底原则）。
  * W3 起生成侧支持流式（replyStreaming，逐 token 回调），守卫与状态推进逻辑经 PlannedAction 与同步路径共用。
  * 阶段 4 起生成前做 RAG 检索（简历资料注入 + 引用溯源），检索失败静默降级为无资料生成。
+ * 阶段 7 起评分不再走生成循环内的阻塞工具（scoreAnswer 已移除）：题目边界（NEXT_QUESTION / SWITCH_TOPIC /
+ * WRAP_UP）触发后台复盘 agent（QuestionReviewService，异步评分 + 参考答案），最近复盘摘要注入后续生成的上下文。
  */
 @Slf4j
 @Service
@@ -56,14 +58,14 @@ public class InterviewAgent {
     private final RagRetrievalService ragRetrievalService;
     private final RagProperties ragProps;
     private final InterviewAgentProperties props;
-    private final AnswerScoreService answerScoreService;
+    private final QuestionReviewService reviewService;
     private final ApplicationEventPublisher eventPublisher;
     private final LlmResilience llmResilience;
 
     public InterviewAgent(ChatClient.Builder chatClientBuilder, SessionService sessionService,
                           ChatContextService chatContextService, InterviewSessionMapper sessionMapper,
                           RagRetrievalService ragRetrievalService, RagProperties ragProps,
-                          InterviewAgentProperties props, AnswerScoreService answerScoreService,
+                          InterviewAgentProperties props, QuestionReviewService reviewService,
                           ApplicationEventPublisher eventPublisher, LlmResilience llmResilience) {
         this.chatClient = chatClientBuilder.build();
         this.fallbackChatClient = chatClientBuilder.build();
@@ -73,7 +75,7 @@ public class InterviewAgent {
         this.ragRetrievalService = ragRetrievalService;
         this.ragProps = ragProps;
         this.props = props;
-        this.answerScoreService = answerScoreService;
+        this.reviewService = reviewService;
         this.eventPublisher = eventPublisher;
         this.llmResilience = llmResilience;
     }
@@ -86,7 +88,7 @@ public class InterviewAgent {
         String jdText = session.getJdText();
         String transcript = buildTranscript(sessionId, userId);
         InterviewTools tools = new InterviewTools(ragRetrievalService, ragProps,
-                userId, session.getResumeFileId(), answerScoreService);
+                userId, session.getResumeFileId());
 
         if (phase == null) {
             log.info("[Agent] 开场 session={}", sessionId);
@@ -115,7 +117,7 @@ public class InterviewAgent {
         String jdText = session.getJdText();
         String transcript = buildTranscript(sessionId, userId);
         InterviewTools tools = new InterviewTools(ragRetrievalService, ragProps,
-                userId, session.getResumeFileId(), answerScoreService);
+                userId, session.getResumeFileId());
 
         PlannedAction plan;
         String decisionTopic = null;
@@ -131,14 +133,30 @@ public class InterviewAgent {
             plan = planAction(sessionId, phase, decision,
                     nz(session.getProbeCount()), nz(session.getQuestionCount()));
         }
-        GenerateInput input = assembleInput(session.getResumeFileId(), jdText, transcript, plan, decisionTopic);
+        GenerateInput input = assembleInput(sessionId, session.getResumeFileId(), jdText, transcript, plan, decisionTopic);
         MessageResponse reply = generateStreaming(sessionId, AgentPrompts.INTERVIEWER_SYSTEM,
                 input.promptText(), plan, tools, input.citations(), onDelta, onThink);
         updatePhase(sessionId, userId, plan.nextPhase(), plan.nextProbe(), plan.nextQuestion(), plan.finish());
+        afterReply(sessionId, userId, plan, reply);
         if (plan.finish()) {
             log.info("[Agent] 面试结束 session={}", sessionId);
         }
         return reply;
+    }
+
+    /** 题目边界触发后台复盘（阶段 7）：出题/切题/收尾时异步复盘刚结束的题；续场落历史边界占位 */
+    private void afterReply(long sessionId, long userId, PlannedAction plan, MessageResponse reply) {
+        if (plan == RESUME_PLAN) {
+            reviewService.markResumeBoundary(sessionId, userId, reply.seq());
+            return;
+        }
+        if (plan == OPENING_PLAN) {
+            return;
+        }
+        if (plan.action() == AgentAction.NEXT_QUESTION || plan.action() == AgentAction.SWITCH_TOPIC
+                || plan.action() == AgentAction.WRAP_UP) {
+            reviewService.submitReview(sessionId, userId, reply.seq());
+        }
     }
 
     // ---------- 决策 ----------
@@ -232,18 +250,20 @@ public class InterviewAgent {
     private MessageResponse finishPlan(long sessionId, long userId, String jdText, String transcript,
                                        String decisionTopic, Long resumeFileId, PlannedAction plan,
                                        InterviewTools tools) {
-        GenerateInput input = assembleInput(resumeFileId, jdText, transcript, plan, decisionTopic);
+        GenerateInput input = assembleInput(sessionId, resumeFileId, jdText, transcript, plan, decisionTopic);
         MessageResponse reply = generateAndPersist(sessionId, AgentPrompts.INTERVIEWER_SYSTEM,
                 input.promptText(), plan.action().name(), tools, input.citations());
         updatePhase(sessionId, userId, plan.nextPhase(), plan.nextProbe(), plan.nextQuestion(), plan.finish());
+        afterReply(sessionId, userId, plan, reply);
         if (plan.finish()) {
             log.info("[Agent] 面试结束 session={}", sessionId);
         }
         return reply;
     }
 
-    /** 生成输入组装（阶段 4）：会话挂载简历时检索相关块注入 prompt，citations 随回复落库；失败静默降级 */
-    private GenerateInput assembleInput(Long resumeFileId, String jdText, String transcript,
+    /** 生成输入组装：会话挂载简历时检索相关块注入 prompt（阶段 4，失败静默降级）；
+     * 阶段 7 起注入最近一题复盘摘要（后台复盘 agent 的评分结论，开场除外） */
+    private GenerateInput assembleInput(long sessionId, Long resumeFileId, String jdText, String transcript,
                                         PlannedAction plan, String decisionTopic) {
         String reference = "";
         List<Citation> citations = null;
@@ -260,7 +280,10 @@ public class InterviewAgent {
                 log.warn("[Agent] RAG 检索失败，按无资料生成 [resume={}]", resumeFileId, e);
             }
         }
-        String prompt = AgentPrompts.generationInput(plan.instruction(), jdText, transcript, reference);
+        String reviewBlock = plan == OPENING_PLAN
+                ? ""
+                : AgentPrompts.reviewBlock(reviewService.latestNote(sessionId));
+        String prompt = AgentPrompts.generationInput(plan.instruction(), jdText, transcript, reference, reviewBlock);
         return new GenerateInput(prompt, citations);
     }
 
